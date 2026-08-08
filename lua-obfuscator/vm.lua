@@ -127,6 +127,19 @@ function Compiler:ceTop(node)
   return dest
 end
 
+function Compiler:ceTopMulti(node)
+  -- parang ceTop pero kung Call, kunin LAHAT ng results (want=-1) sa isang slot
+  if node.kind == "Call" then
+    local saved = self.free
+    local base = self:ceTop(node.callee)
+    for _, arg in ipairs(node.args) do self:ceTop(arg) end
+    self:emit(OPMAP[21], base, #node.args, -1)
+    self.free = saved + 1
+    return base
+  end
+  return self:ceTop(node)
+end
+
 function Compiler:ceInto(node, dest)
   local k = node.kind
 
@@ -173,7 +186,7 @@ function Compiler:ceInto(node, dest)
     local saved = self.free
     local base = self:ceTop(node.callee)
     for _, arg in ipairs(node.args) do self:ceTop(arg) end
-    self:emit(OPMAP[21], base, #node.args)
+    self:emit(OPMAP[21], base, #node.args, 1)
     self.free = saved
     if base ~= dest then self:emit(OPMAP[2], dest, base) end
     if self.free < dest + 1 then self.free = dest + 1 end
@@ -212,6 +225,9 @@ function Compiler:ceInto(node, dest)
     self:emit(OPMAP[30], dest, obj, keyReg)
     self.free = saved; if self.free < dest + 1 then self.free = dest + 1 end
 
+  elseif k == "Vararg" then
+    self:emit(OPMAP[36], dest, 1)
+
   elseif k == "MethodCall" then
     local saved = self.free
     local objReg = self:ceTop(node.object)
@@ -219,7 +235,7 @@ function Compiler:ceInto(node, dest)
     self:reserve(1)
     self:emit(OPMAP[32], base, objReg, self:addK(node.method))
     for _, arg in ipairs(node.args) do self:ceTop(arg) end
-    self:emit(OPMAP[21], base, #node.args + 1)
+    self:emit(OPMAP[21], base, #node.args + 1, 1)
     self.free = saved
     if base ~= dest then self:emit(OPMAP[2], dest, base) end
     if self.free < dest + 1 then self.free = dest + 1 end
@@ -274,9 +290,19 @@ function Compiler:compileStmt(node)
 
   elseif k == "Return" then
     if #node.values == 0 then self:emit(OPMAP[23])
-    elseif #node.values == 1 then
+    elseif #node.values == 1 and node.values[1].kind ~= "Vararg" and node.values[1].kind ~= "Call" then
       local saved = self.free; local r = self:ceTop(node.values[1]); self:emit(OPMAP[22], r); self.free = saved
-    else fail() end
+    else
+      local saved = self.free; local base = self.free; local n = 0
+      for idx, val in ipairs(node.values) do
+        local isLast = (idx == #node.values)
+        if val.kind == "Vararg" then local d = self:reserve(1); self:emit(OPMAP[36], d, 1); n = n + 1
+        elseif val.kind == "Call" and isLast then self:ceTopMulti(val); n = n + 1
+        else self:ceTop(val); n = n + 1 end
+      end
+      self:emit(OPMAP[35], base, n)
+      self.free = saved
+    end
 
   elseif k == "If" then
     local endJumps = {}
@@ -328,6 +354,41 @@ function Compiler:compileStmt(node)
 
   elseif k == "Do" then
     self:pushScope(); self:compileBlock(node.body); self:popScope()
+
+  elseif k == "Repeat" then
+    self:pushScope()
+    local top = self:here() + 1
+    self:compileBlock(node.body)
+    local sf = self.free
+    local cond = self:ceTop(node.cond)
+    self:emit(OPMAP[25], cond, top)   -- JMPIFNOT cond -> top (ulitin kung false)
+    self.free = sf
+    self:popScope()
+
+  elseif k == "MultiAssign" then
+    local saved = self.free
+    local valRegs = {}
+    for _, v in ipairs(node.values) do table.insert(valRegs, self:ceTop(v)) end
+    for idx, t in ipairs(node.targets) do
+      local vr = valRegs[idx]
+      if vr ~= nil then
+        if t.kind == "Variable" then
+          local kind, x = self:refVar(t.name)
+          if kind == "local" then self:emit(OPMAP[2], x, vr)
+          elseif kind == "upval" then self:emit(OPMAP[28], vr, x)
+          else self:emit(OPMAP[4], vr, self:addK(t.name)) end
+        elseif t.kind == "Index" then
+          local s2 = self.free
+          local obj = self:ceTop(t.object)
+          local keyReg
+          if t.field ~= nil then keyReg = self:ceTop({ kind = "String", value = string.format("%q", t.field) })
+          else keyReg = self:ceTop(t.index) end
+          self:emit(OPMAP[31], obj, keyReg, vr)
+          self.free = s2
+        end
+      end
+    end
+    self.free = saved
 
   elseif k == "GenericFor" then
     self:pushScope()
@@ -458,7 +519,10 @@ function VM.prelude()
     "  for r in pairs(boxed) do cells[r] = { v = nil } end",
     "  local function gR(r) if boxed[r] then return cells[r].v else return R[r] end end",
     "  local function sR(r, val) if boxed[r] then cells[r].v = val else R[r] = val end end",
-    "  for p = 1, #args do sR(p-1, args[p]) end",
+    "  local np = proto.np or 0",
+    "  local __va = {}",
+    "  for p = np + 1, #args do __va[p - np] = args[p] end",
+    "  for p = 1, np do sR(p-1, args[p]) end",
     "  local i = 1",
     "  local n = #code",
     "  while i <= n do",
@@ -484,13 +548,28 @@ function VM.prelude()
     "    elseif op == 19 then sR(d(i), not gR(d(i+1))); i = i + 2",
     "    elseif op == 20 then sR(d(i), #gR(d(i+1))); i = i + 2",
     "    elseif op == 21 then",
-    "      local base = d(i); local argc = d(i+1); i = i + 2",
+    "      local base = d(i); local argc = d(i+1); local want = d(i+2); i = i + 3",
     "      local fn = gR(base)",
     "      local a = {}",
     "      for j = 1, argc do a[j] = gR(base + j) end",
-    "      sR(base, fn(table.unpack(a, 1, argc)))",
+    "      local rv = { fn(table.unpack(a, 1, argc)) }",
+    "      if want < 0 then rv.__multi = true; sR(base, rv) else for w = 1, want do sR(base + w - 1, rv[w]) end end",
     "    elseif op == 22 then return gR(d(i))",
     "    elseif op == 23 then return",
+    "    elseif op == 35 then",
+    "      local base = d(i); local nn = d(i+1); i = i + 2",
+    "      local rv = {}",
+    "      local ri = 0",
+    "      for j = 0, nn - 1 do",
+    "        local val = gR(base + j)",
+    "        if type(val) == 'table' and val.__multi then",
+    "          for _, vv in ipairs(val) do ri = ri + 1; rv[ri] = vv end",
+    "        else ri = ri + 1; rv[ri] = val end",
+    "      end",
+    "      return table.unpack(rv, 1, ri)",
+    "    elseif op == 36 then",
+    "      local dest = d(i); local nn = d(i+1); i = i + 2",
+    "      for j = 0, nn - 1 do sR(dest + j, __va[j + 1]) end",
     "    elseif op == 24 then i = d(i)",
     "    elseif op == 25 then",
     "      local reg = d(i); local target = d(i+1); i = i + 2",
