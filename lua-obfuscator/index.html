@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Solaraph — Lua Obfuscator</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 24px;
+        background: #0d1117;
+        color: #e6edf3;
+      }
+      h1 {
+        margin-bottom: 4px;
+      }
+      .sub {
+        color: #8b949e;
+        margin-top: 0;
+      }
+      .cols {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+      }
+      .col {
+        flex: 1;
+        min-width: 320px;
+      }
+      label {
+        font-weight: 600;
+        display: block;
+        margin-bottom: 6px;
+      }
+      textarea {
+        width: 100%;
+        height: 380px;
+        font-family: ui-monospace, monospace;
+        font-size: 13px;
+        background: #161b22;
+        color: #e6edf3;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 12px;
+        resize: vertical;
+      }
+      .flags {
+        margin: 16px 0;
+        display: flex;
+        gap: 18px;
+        flex-wrap: wrap;
+      }
+      .flags label {
+        font-weight: 400;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      button {
+        background: #238636;
+        color: #fff;
+        border: none;
+        padding: 10px 22px;
+        border-radius: 8px;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #2ea043;
+      }
+      button:disabled {
+        background: #30363d;
+        cursor: not-allowed;
+      }
+      #status {
+        margin-left: 12px;
+        color: #8b949e;
+      }
+      .err {
+        color: #f85149;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Solaraph</h1>
+    <p class="sub">
+      Lua obfuscator — tumatakbo lahat sa browser mo. Walang code na iniiwan sa
+      server.
+    </p>
+
+    <div class="flags">
+      <label
+        ><input type="checkbox" id="rename" checked /> Rename variables</label
+      >
+      <label
+        ><input type="checkbox" id="numbers" checked /> Obfuscate numbers</label
+      >
+      <label
+        ><input type="checkbox" id="strings" checked /> Encrypt strings</label
+      >
+      <label><input type="checkbox" id="minify" checked /> Minify</label>
+    </div>
+
+    <div>
+      <button id="run" disabled>Loading…</button>
+      <span id="status">Naglo-load ng Lua engine…</span>
+    </div>
+
+    <div class="cols" style="margin-top: 16px">
+      <div class="col">
+        <label for="input">Input Lua</label>
+        <textarea id="input" spellcheck="false">
+local function add(a, b)
+  return a + b
+end
+
+local total = 0
+for i = 1, 10 do
+  total = total + i
+end
+
+if total > 5 then
+  print("malaki: " .. total)
+else
+  print("maliit")
+end</textarea
+        >
+      </div>
+      <div class="col">
+        <label for="output">Obfuscated output</label>
+        <textarea id="output" spellcheck="false" readonly></textarea>
+      </div>
+    </div>
+
+    <script src="[cdn.jsdelivr.net](https://cdn.jsdelivr.net/npm/fengari-web@0.1.4/dist/fengari-web.js)"></script>
+    <script>
+      const MODULES = [
+        "lexer",
+        "parser",
+        "renamer",
+        "numenc",
+        "stringenc",
+        "generator",
+      ];
+      const L = fengari.L;
+      const { lua, lauxlib, lualib, to_luastring } = fengari;
+
+      const statusEl = document.getElementById("status");
+      const runBtn = document.getElementById("run");
+
+      // 1. Kunin ang lahat ng .lua files, i-preload bilang loaded packages
+      async function loadModules() {
+        for (const name of MODULES) {
+          const res = await fetch(name + ".lua");
+          if (!res.ok) throw new Error("Hindi ma-load: " + name + ".lua");
+          const src = await res.text();
+          // i-compile at itago sa package.loaded[name]
+          const chunk =
+            'package.loaded["' + name + '"] = (function() ' + src + "\nend)()";
+          if (lauxlib.luaL_dostring(L, to_luastring(chunk)) !== lua.LUA_OK) {
+            const err = lua.lua_tojsstring(L, -1);
+            throw new Error("Error sa " + name + ".lua: " + err);
+          }
+        }
+      }
+
+      // 2. Ang obfuscate driver — Lua na tumatawag sa mga module mo
+      const DRIVER = `
+    local Lexer     = require("lexer")
+    local Parser    = require("parser")
+    local Renamer   = require("renamer")
+    local NumEnc    = require("numenc")
+    local StringEnc = require("stringenc")
+    local Generator = require("generator")
+
+    return function(source, doRename, doNumbers, doStrings, doMinify)
+      math.randomseed(os.time())
+      local tokens = Lexer.tokenize(source)
+      local ast    = Parser.parse(tokens)
+      if doRename  then ast = Renamer.rename(ast) end
+      if doNumbers then ast = NumEnc.obfuscate(ast) end
+      if doStrings then ast = StringEnc.encrypt(ast) end
+      local body = Generator.generate(ast, doMinify)
+      if doStrings then
+        return StringEnc.prelude() .. body
+      end
+      return body
+    end
+  `;
+
+      function obfuscate(source, flags) {
+        // ilagay ang driver, tapos tawagin gamit ang stack
+        if (lauxlib.luaL_dostring(L, to_luastring(DRIVER)) !== lua.LUA_OK) {
+          throw new Error(lua.lua_tojsstring(L, -1));
+        }
+        // ngayon nasa top ng stack ang function; push args
+        lua.lua_pushstring(L, to_luastring(source));
+        lua.lua_pushboolean(L, flags.rename);
+        lua.lua_pushboolean(L, flags.numbers);
+        lua.lua_pushboolean(L, flags.strings);
+        lua.lua_pushboolean(L, flags.minify);
+        if (lua.lua_pcall(L, 5, 1, 0) !== lua.LUA_OK) {
+          const err = lua.lua_tojsstring(L, -1);
+          lua.lua_pop(L, 1);
+          throw new Error(err);
+        }
+        const result = lua.lua_tojsstring(L, -1);
+        lua.lua_pop(L, 1);
+        return result;
+      }
+
+      (async function init() {
+        try {
+          await loadModules();
+          runBtn.disabled = false;
+          runBtn.textContent = "Obfuscate";
+          statusEl.textContent = "Handa na.";
+        } catch (e) {
+          statusEl.innerHTML = '<span class="err">' + e.message + "</span>";
+        }
+      })();
+
+      runBtn.addEventListener("click", function () {
+        const source = document.getElementById("input").value;
+        const flags = {
+          rename: document.getElementById("rename").checked,
+          numbers: document.getElementById("numbers").checked,
+          strings: document.getElementById("strings").checked,
+          minify: document.getElementById("minify").checked,
+        };
+        try {
+          statusEl.textContent = "Nag-o-obfuscate…";
+          const out = obfuscate(source, flags);
+          document.getElementById("output").value = out;
+          statusEl.textContent = "Tapos! (" + out.length + " bytes)";
+        } catch (e) {
+          document.getElementById("output").value = "";
+          statusEl.innerHTML =
+            '<span class="err">MALI: ' + e.message + "</span>";
+        }
+      });
+    </script>
+  </body>
+</html>
