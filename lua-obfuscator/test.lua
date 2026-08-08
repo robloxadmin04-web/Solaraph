@@ -2,10 +2,10 @@
 local Lexer = require("lexer")
 
 local code = [[
-local x = 1 + 2   -- ito ay comment, dapat mawala
-local name = "Solaraph"
-local msg = 'hello world'
-print(x)
+if x == 2 then
+  y = a .. b
+  z = ...
+end
 ]]
 
 local tokens = Lexer.tokenize(code)

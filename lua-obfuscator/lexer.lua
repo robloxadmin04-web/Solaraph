@@ -76,11 +76,27 @@ function Lexer.tokenize(source)
       end
       table.insert(tokens, { type = "NUMBER", value = source:sub(start, i - 1), line = line })
 
-    -- 7. Operator o simbolo (isahan muna)
+        -- 7. Operators at symbols (multi-char muna, tapos isahan)
     else
-      table.insert(tokens, { type = "OPERATOR", value = c, line = line })
-      i = i + 1
+      -- subukan muna ang tatluhan: ...
+      local three = source:sub(i, i + 2)
+      local two   = source:sub(i, i + 1)
+
+      if three == "..." then
+        table.insert(tokens, { type = "OPERATOR", value = "...", line = line })
+        i = i + 3
+      -- tapos ang dalawahan: == ~= <= >= ..
+      elseif two == "==" or two == "~=" or two == "<="
+          or two == ">=" or two == ".." then
+        table.insert(tokens, { type = "OPERATOR", value = two, line = line })
+        i = i + 2
+      -- kung wala sa mga 'yon, isahan
+      else
+        table.insert(tokens, { type = "OPERATOR", value = c, line = line })
+        i = i + 1
+      end
     end
+
   end
 
   table.insert(tokens, { type = "EOF", value = "<eof>", line = line })
