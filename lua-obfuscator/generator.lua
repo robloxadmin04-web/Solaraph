@@ -1,5 +1,5 @@
 -- generator.lua
--- Code generator: AST -> Lua source. May normal at minify mode.
+-- Code generator: AST -> Lua source. Normal at minify mode.
 
 local Generator = {}
 Generator.__index = Generator
@@ -11,13 +11,11 @@ function Generator.new(minify)
   return self
 end
 
--- Sa minify: walang indent. Sa normal: 2 spaces bawat level.
 function Generator:indent()
   if self.minify then return "" end
   return string.rep("  ", self.indentLevel)
 end
 
--- Separator ng statements: newline (normal) o space (minify)
 function Generator:sep()
   if self.minify then return " " end
   return "\n"
@@ -30,15 +28,13 @@ function Generator:genExpr(node)
 
   if k == "Number" or k == "String" then
     return node.value
-
   elseif k == "Literal" then
-    return node.value   -- true, false, nil
-
+    return node.value
   elseif k == "Variable" then
     return node.name
-
+  elseif k == "Vararg" then
+    return "..."
   elseif k == "Raw" then
-    -- pre-generated na text (galing sa string/number encryption)
     return node.text
 
   elseif k == "UnaryOp" then
@@ -53,10 +49,14 @@ function Generator:genExpr(node)
 
   elseif k == "Call" then
     local args = {}
-    for _, a in ipairs(node.args) do
-      table.insert(args, self:genExpr(a))
-    end
+    for _, a in ipairs(node.args) do table.insert(args, self:genExpr(a)) end
     return self:genExpr(node.callee) .. "(" .. table.concat(args, ", ") .. ")"
+
+  elseif k == "MethodCall" then
+    local args = {}
+    for _, a in ipairs(node.args) do table.insert(args, self:genExpr(a)) end
+    return self:genExpr(node.object) .. ":" .. node.method
+      .. "(" .. table.concat(args, ", ") .. ")"
 
   elseif k == "Index" then
     if node.field then
@@ -64,6 +64,19 @@ function Generator:genExpr(node)
     else
       return self:genExpr(node.object) .. "[" .. self:genExpr(node.index) .. "]"
     end
+
+  elseif k == "Table" then
+    local parts = {}
+    for _, f in ipairs(node.fields) do
+      if f.kind == "array" then
+        table.insert(parts, self:genExpr(f.value))
+      elseif f.kind == "named" then
+        table.insert(parts, f.name .. " = " .. self:genExpr(f.value))
+      elseif f.kind == "keyed" then
+        table.insert(parts, "[" .. self:genExpr(f.key) .. "] = " .. self:genExpr(f.value))
+      end
+    end
+    return "{" .. table.concat(parts, ", ") .. "}"
 
   elseif k == "Function" then
     local params = table.concat(node.params, ", ")
@@ -85,14 +98,21 @@ function Generator:genStatement(node)
   local pad = self:indent()
 
   if k == "LocalAssignment" then
-    if node.value then
-      return pad .. "local " .. node.name .. " = " .. self:genExpr(node.value)
+    local names = table.concat(node.names, ", ")
+    if node.values and #node.values > 0 then
+      local vals = {}
+      for _, v in ipairs(node.values) do table.insert(vals, self:genExpr(v)) end
+      return pad .. "local " .. names .. " = " .. table.concat(vals, ", ")
     else
-      return pad .. "local " .. node.name
+      return pad .. "local " .. names
     end
 
   elseif k == "Assignment" then
-    return pad .. self:genExpr(node.target) .. " = " .. self:genExpr(node.value)
+    local targets = {}
+    for _, t in ipairs(node.targets) do table.insert(targets, self:genExpr(t)) end
+    local vals = {}
+    for _, v in ipairs(node.values) do table.insert(vals, self:genExpr(v)) end
+    return pad .. table.concat(targets, ", ") .. " = " .. table.concat(vals, ", ")
 
   elseif k == "LocalFunction" then
     local params = table.concat(node.func.params, ", ")
@@ -104,13 +124,30 @@ function Generator:genStatement(node)
     return out
 
   elseif k == "FunctionDeclaration" then
-    local params = table.concat(node.func.params, ", ")
-    local out = pad .. "function " .. node.name .. "(" .. params .. ")" .. self:sep()
-    self.indentLevel = self.indentLevel + 1
-    out = out .. self:genBlock(node.func.body)
-    self.indentLevel = self.indentLevel - 1
-    out = out .. pad .. "end"
-    return out
+    -- ang target ay Index/Variable; kung method, tanggalin ang implicit self sa display
+    local params = node.func.params
+    if node.isMethod then
+      -- ang unang param ay "self" (implicit sa : syntax) — tanggalin sa output
+      local shown = {}
+      for i = 2, #params do table.insert(shown, params[i]) end
+      -- gamitin ang : syntax: function obj:method(...)
+      local obj = self:genExpr(node.target.object)
+      local out = pad .. "function " .. obj .. ":" .. node.target.field
+        .. "(" .. table.concat(shown, ", ") .. ")" .. self:sep()
+      self.indentLevel = self.indentLevel + 1
+      out = out .. self:genBlock(node.func.body)
+      self.indentLevel = self.indentLevel - 1
+      out = out .. pad .. "end"
+      return out
+    else
+      local out = pad .. "function " .. self:genExpr(node.target)
+        .. "(" .. table.concat(params, ", ") .. ")" .. self:sep()
+      self.indentLevel = self.indentLevel + 1
+      out = out .. self:genBlock(node.func.body)
+      self.indentLevel = self.indentLevel - 1
+      out = out .. pad .. "end"
+      return out
+    end
 
   elseif k == "If" then
     local out = ""
@@ -138,12 +175,26 @@ function Generator:genStatement(node)
     out = out .. pad .. "end"
     return out
 
+  elseif k == "Repeat" then
+    local out = pad .. "repeat" .. self:sep()
+    self.indentLevel = self.indentLevel + 1
+    out = out .. self:genBlock(node.body)
+    self.indentLevel = self.indentLevel - 1
+    out = out .. pad .. "until " .. self:genExpr(node.cond)
+    return out
+
+  elseif k == "Do" then
+    local out = pad .. "do" .. self:sep()
+    self.indentLevel = self.indentLevel + 1
+    out = out .. self:genBlock(node.body)
+    self.indentLevel = self.indentLevel - 1
+    out = out .. pad .. "end"
+    return out
+
   elseif k == "NumericFor" then
     local header = pad .. "for " .. node.var .. " = "
       .. self:genExpr(node.startExpr) .. ", " .. self:genExpr(node.stopExpr)
-    if node.stepExpr then
-      header = header .. ", " .. self:genExpr(node.stepExpr)
-    end
+    if node.stepExpr then header = header .. ", " .. self:genExpr(node.stepExpr) end
     local out = header .. " do" .. self:sep()
     self.indentLevel = self.indentLevel + 1
     out = out .. self:genBlock(node.body)
@@ -152,8 +203,10 @@ function Generator:genStatement(node)
     return out
 
   elseif k == "GenericFor" then
+    local iters = {}
+    for _, it in ipairs(node.iters) do table.insert(iters, self:genExpr(it)) end
     local out = pad .. "for " .. table.concat(node.names, ", ")
-      .. " in " .. self:genExpr(node.iter) .. " do" .. self:sep()
+      .. " in " .. table.concat(iters, ", ") .. " do" .. self:sep()
     self.indentLevel = self.indentLevel + 1
     out = out .. self:genBlock(node.body)
     self.indentLevel = self.indentLevel - 1
@@ -161,13 +214,9 @@ function Generator:genStatement(node)
     return out
 
   elseif k == "Return" then
-    if #node.values == 0 then
-      return pad .. "return"
-    end
+    if #node.values == 0 then return pad .. "return" end
     local vals = {}
-    for _, v in ipairs(node.values) do
-      table.insert(vals, self:genExpr(v))
-    end
+    for _, v in ipairs(node.values) do table.insert(vals, self:genExpr(v)) end
     return pad .. "return " .. table.concat(vals, ", ")
 
   elseif k == "Break" then
@@ -180,7 +229,6 @@ function Generator:genStatement(node)
   error("Hindi ma-generate ang statement: " .. tostring(k))
 end
 
--- Gawing string ang listahan ng statements
 function Generator:genBlock(statements)
   local lines = {}
   for _, stmt in ipairs(statements) do
@@ -189,7 +237,6 @@ function Generator:genBlock(statements)
   return table.concat(lines, self:sep()) .. self:sep()
 end
 
--- entry point: generate(ast) o generate(ast, true) para sa minify
 function Generator.generate(ast, minify)
   local self = Generator.new(minify)
   return self:genBlock(ast.body)

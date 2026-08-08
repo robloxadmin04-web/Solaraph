@@ -1,52 +1,39 @@
 -- test.lua
 local Lexer = require("lexer")
 local Parser = require("parser")
-local Renamer = require("renamer")
-local NumEnc = require("numenc")
-local StringEnc = require("stringenc")
 local Generator = require("generator")
 
-math.randomseed(os.time())
-
 local code = [[
-local function add(a, b)
-  return a + b
+local t = { 1, 2, name = "Solaraph", [10] = "ten" }
+
+function t:greet(prefix)
+  return prefix .. self.name
 end
 
-local total = 0
-for i = 1, 10 do
-  total = total + i
+local obj = {}
+obj.count = 0
+local a, b = 1, 2
+a, b = b, a
+
+for k, v in pairs(t) do
+  print(k, v)
 end
 
-if total > 5 then
-  print("malaki: " .. total)
-else
-  print("maliit")
-end
+print(t:greet("Hi, "))
 ]]
 
--- BUONG PIPELINE
 local tokens = Lexer.tokenize(code)
 local ast = Parser.parse(tokens)
+local output = Generator.generate(ast)
 
-ast = Renamer.rename(ast)          -- 1. variable renaming
-ast = NumEnc.obfuscate(ast)        -- 2. number obfuscation
-ast = StringEnc.encrypt(ast)       -- 3. string encryption
-
--- 4. minify (true = compact)
-local body = Generator.generate(ast, true)
-local output = StringEnc.prelude() .. body
-
-print("===== ORIHINAL =====")
-print(code)
-print("===== OBFUSCATED =====")
+print("===== GENERATED =====")
 print(output)
 
-print("===== PATAKBUHIN ANG OBFUSCATED =====")
+print("===== PATAKBUHIN =====")
 local fn = load(output)
 if fn then
   fn()
-  print("(gumana ang obfuscated code!)")
+  print("(gumana!)")
 else
-  print("MALI: hindi valid ang obfuscated code")
+  print("MALI: hindi valid ang generated code")
 end
