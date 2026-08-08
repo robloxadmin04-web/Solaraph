@@ -1,361 +1,395 @@
 -- vm.lua
--- Obfuscation pass: FULL-PROGRAM VM (register-based, Hakbang 1+2).
+-- Obfuscation pass: FULL-PROGRAM VM (register-based, may closures/upvalues).
 --
--- Kino-compile ang mga block ng code sa REGISTER-BASED bytecode para sa isang
--- maliit na VM, tapos pinapalitan ang orihinal ng isang tawag sa interpreter:
+-- Kino-compile ang BUONG program tungo sa isang tree ng register-based protos
+-- para sa isang maliit na VM, tapos pinapalitan ang buong AST body ng __vmmain().
+-- Gumagamit ng free-register STACK DISCIPLINE (Lua/Guile style): ang callee at
+-- args ng isang call ay palaging nasa contiguous slots sa tuktok, walang buhay
+-- na value sa ibaba. Ang mga captured local ay naka-cell mula birth (upvalues).
 --
---    <mga statement>  -->  __vmrun({...bytecode...}, {...constants...})
---
--- KAYA NITO (kabaligtaran ng lumang stack VM na constants-lang):
---   * local variables (registers/slots)
+-- KAYA NITO:
+--   * local variables (registers) + function parameters
 --   * arithmetic, concat, comparison, unary
---   * function calls na may tamang arguments
---   * global lookup (print, pairs, atbp.)
---   * if / elseif / else, while, numeric for  (via jumps)
+--   * function calls, NESTED calls sa loob ng expressions
+--   * global lookup + assignment
+--   * if/elseif/else, while, numeric for
+--   * NESTED functions (local function / function literal) + upvalues + recursion
 --
--- HINDI PA (susunod na hakbang â€” closures):
---   * nested function definitions (local function / function ... end)
---   * generic for, repeat, method calls, multiple assignment >1, varargs
---   * tables, index/field access
--- Kapag may nakita nito, IWINAN ang buong block na normal (walang binago),
--- kaya garantisadong hindi nasisira ang code â€” lumiliit lang ang saklaw.
+-- SAFE FALLBACK: kung may nakitang hindi suportado (method call, table, index,
+-- generic for, repeat, multi-assign, varargs, multi-return, break), itinatapon
+-- ang buong pagtatangka at iniiwan ang program na normal â€” hindi masisira.
 --
--- Tumatakbo dapat HULI-HULI (pagkatapos ng rename) â€” kino-capture ang GLOBAL
--- names bilang runtime lookup; ang locals ay nagiging registers.
+-- Tumatakbo dapat HULI-HULI (pagkatapos ng rename).
 
 local VM = {}
 
--- ===== Opcodes =====
-local OP = {
-  LOADK=1, MOVE=2, GETGLOBAL=3,
-  ADD=4, SUB=5, MUL=6, DIV=7, MOD=8, POW=9, CONCAT=10,
-  EQ=11, NE=12, LT=13, GT=14, LE=15, GE=16,
-  NEG=17, NOT=18, LEN=19,
-  CALL=20,       -- CALL base, argc   -> R[base] = R[base](R[base+1..base+argc])
-  RETURN=21,     -- RETURN reg
-  JMP=22,        -- JMP target
-  JMPIFNOT=23,   -- JMPIFNOT reg, target
-}
+local UNSUPPORTED = "__vm_unsupported"
+local function fail() error(UNSUPPORTED, 0) end
 
--- ===== Compiler (may exception para sa unsupported) =====
+local protos
+local function resetProtos() protos = {} end
+local function addProto(p) table.insert(protos, p); return #protos end
 
-local function newCompiler()
-  return {
-    code = {}, K = {}, nextReg = 0,
+-- ===== Compiler =====
+local Compiler = {}
+Compiler.__index = Compiler
+
+local function newCompiler(parent)
+  return setmetatable({
+    code = {}, K = {},
+    free = 0, nlocals = 0,
     scopes = { {} },
-    ok = true,
-  }
+    parent = parent,
+    upvals = {}, captured = {}, boxed = {},
+    lstack = {},
+  }, Compiler)
 end
 
-local function fail(c) c.ok = false; error("__vm_unsupported", 0) end
-
-local function addK(c, v)
-  for i, e in ipairs(c.K) do
-    if e.v == v and e.t == type(v) then return i end
+function Compiler:addK(v)
+  for i, e in ipairs(self.K) do if e.v == v and e.t == type(v) then return i end end
+  table.insert(self.K, { v = v, t = type(v) }); return #self.K
+end
+function Compiler:reserve(n) local r = self.free; self.free = self.free + n; return r end
+function Compiler:pushScope() table.insert(self.scopes, {}); table.insert(self.lstack, self.nlocals) end
+function Compiler:popScope() table.remove(self.scopes); self.nlocals = table.remove(self.lstack); self.free = self.nlocals end
+function Compiler:declare(name)
+  local r = self.nlocals
+  self.scopes[#self.scopes][name] = r
+  self.nlocals = self.nlocals + 1
+  if self.free < self.nlocals then self.free = self.nlocals end
+  return r
+end
+function Compiler:resolveLocal(name)
+  for i = #self.scopes, 1, -1 do local r = self.scopes[i][name]; if r ~= nil then return r end end
+  return nil
+end
+function Compiler:resolveUpval(name)
+  if self.captured[name] ~= nil then return self.captured[name] end
+  if not self.parent then return nil end
+  local pl = self.parent:resolveLocal(name)
+  if pl ~= nil then
+    self.parent.boxed[pl] = true
+    local idx = #self.upvals + 1
+    self.upvals[idx] = { fromLocal = pl }; self.captured[name] = idx; return idx
   end
-  table.insert(c.K, { v = v, t = type(v) })
-  return #c.K
-end
-
-local function alloc(c) local r = c.nextReg; c.nextReg = r + 1; return r end
-local function pushScope(c) table.insert(c.scopes, {}) end
-local function popScope(c) table.remove(c.scopes) end
-local function declare(c, name) local r = alloc(c); c.scopes[#c.scopes][name] = r; return r end
-local function resolve(c, name)
-  for i = #c.scopes, 1, -1 do
-    local r = c.scopes[i][name]
-    if r ~= nil then return r end
+  local pu = self.parent:resolveUpval(name)
+  if pu ~= nil then
+    local idx = #self.upvals + 1
+    self.upvals[idx] = { fromUpval = pu }; self.captured[name] = idx; return idx
   end
   return nil
 end
-local function emit(c, ...) local t = {...}; for _, x in ipairs(t) do table.insert(c.code, x) end end
-local function here(c) return #c.code end
--- emit ng jump na may placeholder na target; ibalik ang index ng operand
-local function emitJmp(c) emit(c, OP.JMP, 0); return #c.code end
-local function emitJmpIfNot(c, reg) emit(c, OP.JMPIFNOT, reg, 0); return #c.code end
-local function patch(c, idx) c.code[idx] = here(c) end
-local function patchTo(c, idx, target) c.code[idx] = target end
+function Compiler:emit(...) local t = {...}; for _, x in ipairs(t) do table.insert(self.code, x) end end
+function Compiler:here() return #self.code end
+function Compiler:emitJmp() self:emit(24, 0); return #self.code end
+function Compiler:emitJmpIfNot(reg) self:emit(25, reg, 0); return #self.code end
+function Compiler:patch(idx) self.code[idx] = self:here() + 1 end
+function Compiler:patchTo(idx, target) self.code[idx] = target end
+function Compiler:refVar(name)
+  local l = self:resolveLocal(name); if l ~= nil then return "local", l end
+  local u = self:resolveUpval(name); if u ~= nil then return "upval", u end
+  return "global", nil
+end
 
 local BINOP = {
-  ["+"]=OP.ADD, ["-"]=OP.SUB, ["*"]=OP.MUL, ["/"]=OP.DIV, ["%"]=OP.MOD, ["^"]=OP.POW,
-  [".."]=OP.CONCAT, ["=="]=OP.EQ, ["~="]=OP.NE,
-  ["<"]=OP.LT, [">"]=OP.GT, ["<="]=OP.LE, [">="]=OP.GE,
+  ["+"]=5, ["-"]=6, ["*"]=7, ["/"]=8, ["%"]=9, ["^"]=10, [".."]=11,
+  ["=="]=12, ["~="]=13, ["<"]=14, [">"]=15, ["<="]=16, [">="]=17,
 }
 
-local compileExpr, compileStmt, compileBlock
+local compileFunction
 
-compileExpr = function(c, node)
+function Compiler:ceTop(node)
+  local dest = self:reserve(1)
+  self:ceInto(node, dest)
+  return dest
+end
+
+function Compiler:ceInto(node, dest)
   local k = node.kind
 
   if k == "Number" then
-    local n = tonumber(node.value); if n == nil then fail(c) end
-    local r = alloc(c); emit(c, OP.LOADK, r, addK(c, n)); return r
+    local n = tonumber(node.value); if n == nil then fail() end
+    self:emit(1, dest, self:addK(n))
 
   elseif k == "String" then
     local raw = node.value; local first = raw:sub(1,1)
-    if first ~= '"' and first ~= "'" then fail(c) end
+    if first ~= '"' and first ~= "'" then fail() end
     local inner = raw:sub(2, #raw-1)
-    if inner:find("\\", 1, true) then fail(c) end
-    local r = alloc(c); emit(c, OP.LOADK, r, addK(c, inner)); return r
+    if inner:find("\\", 1, true) then fail() end
+    self:emit(1, dest, self:addK(inner))
 
   elseif k == "Literal" then
-    if node.value == "true" then local r=alloc(c); emit(c,OP.LOADK,r,addK(c,true)); return r
-    elseif node.value == "false" then local r=alloc(c); emit(c,OP.LOADK,r,addK(c,false)); return r
-    else fail(c) end   -- nil: laktawan (walang malinis na K rep)
+    if node.value == "true" then self:emit(1, dest, self:addK(true))
+    elseif node.value == "false" then self:emit(1, dest, self:addK(false))
+    else fail() end
 
   elseif k == "Variable" then
-    local localReg = resolve(c, node.name)
-    if localReg ~= nil then return localReg end
-    local r = alloc(c); emit(c, OP.GETGLOBAL, r, addK(c, node.name)); return r
+    local kind, x = self:refVar(node.name)
+    if kind == "local" then self:emit(2, dest, x)
+    elseif kind == "upval" then self:emit(27, dest, x)
+    else self:emit(3, dest, self:addK(node.name)) end
 
   elseif k == "BinaryOp" then
-    local opc = BINOP[node.op]; if not opc then fail(c) end
-    local a = compileExpr(c, node.left)
-    local b = compileExpr(c, node.right)
-    local r = alloc(c); emit(c, opc, r, a, b); return r
+    local opc = BINOP[node.op]; if not opc then fail() end
+    local saved = self.free
+    local a = self:ceTop(node.left)
+    local b = self:ceTop(node.right)
+    self:emit(opc, dest, a, b)
+    self.free = saved; if self.free < dest + 1 then self.free = dest + 1 end
 
   elseif k == "UnaryOp" then
-    local a = compileExpr(c, node.operand)
-    local r = alloc(c)
-    if node.op == "-" then emit(c, OP.NEG, r, a)
-    elseif node.op == "not" then emit(c, OP.NOT, r, a)
-    elseif node.op == "#" then emit(c, OP.LEN, r, a)
-    else fail(c) end
-    return r
+    local saved = self.free
+    local a = self:ceTop(node.operand)
+    if node.op == "-" then self:emit(18, dest, a)
+    elseif node.op == "not" then self:emit(19, dest, a)
+    elseif node.op == "#" then self:emit(20, dest, a)
+    else fail() end
+    self.free = saved; if self.free < dest + 1 then self.free = dest + 1 end
 
   elseif k == "Call" then
-    local fnReg = compileExpr(c, node.callee)
-    local argRegs = {}
-    for _, a in ipairs(node.args) do table.insert(argRegs, compileExpr(c, a)) end
-    -- contiguous block: base = fn, base+1..base+argc = args
-    local base = alloc(c); emit(c, OP.MOVE, base, fnReg)
-    for _, ar in ipairs(argRegs) do local slot = alloc(c); emit(c, OP.MOVE, slot, ar) end
-    emit(c, OP.CALL, base, #node.args)
-    return base
+    local saved = self.free
+    local base = self:ceTop(node.callee)
+    for _, arg in ipairs(node.args) do self:ceTop(arg) end
+    self:emit(21, base, #node.args)
+    self.free = saved
+    if base ~= dest then self:emit(2, dest, base) end
+    if self.free < dest + 1 then self.free = dest + 1 end
+
+  elseif k == "Function" then
+    local pi = compileFunction(self, node.params, node.body)
+    self:emit(26, dest, pi)
 
   else
-    fail(c)  -- MethodCall, Index, Table, Function, Vararg, Raw: hindi pa
+    fail()
   end
 end
 
-compileStmt = function(c, node)
+function Compiler:compileStmt(node)
   local k = node.kind
 
   if k == "LocalAssignment" then
-    -- suportado lang ang 1:1 o values muna tapos declare
-    local vals = {}
-    if node.values then for _, v in ipairs(node.values) do table.insert(vals, compileExpr(c, v)) end end
-    for i, name in ipairs(node.names) do
-      local r = declare(c, name)
-      if vals[i] ~= nil then emit(c, OP.MOVE, r, vals[i]) end
-    end
+    local vs = {}
+    if node.values then for _, v in ipairs(node.values) do table.insert(vs, self:ceTop(v)) end end
+    local regs = {}
+    for _, name in ipairs(node.names) do table.insert(regs, self:declare(name)) end
+    for i = 1, #node.names do if vs[i] ~= nil then self:emit(2, regs[i], vs[i]) end end
+    self.free = self.nlocals
+
+  elseif k == "LocalFunction" then
+    local r = self:declare(node.name)
+    local pi = compileFunction(self, node.func.params, node.func.body)
+    self:emit(26, r, pi)
+    self.free = self.nlocals
 
   elseif k == "Assignment" then
-    -- targets ay dapat simpleng local Variable
-    local vals = {}
-    for _, v in ipairs(node.values) do table.insert(vals, compileExpr(c, v)) end
+    if #node.targets ~= #node.values then fail() end
+    local saved = self.free
+    local vs = {}
+    for _, v in ipairs(node.values) do table.insert(vs, self:ceTop(v)) end
     for i, t in ipairs(node.targets) do
-      if t.kind ~= "Variable" then fail(c) end
-      local r = resolve(c, t.name)
-      if r == nil then fail(c) end   -- assignment sa global: hindi pa
-      if vals[i] ~= nil then emit(c, OP.MOVE, r, vals[i]) end
+      if t.kind ~= "Variable" then fail() end
+      local kind, x = self:refVar(t.name)
+      if kind == "local" then self:emit(2, x, vs[i])
+      elseif kind == "upval" then self:emit(28, vs[i], x)
+      else self:emit(4, vs[i], self:addK(t.name)) end
     end
+    self.free = saved
 
   elseif k == "CallStatement" then
-    compileExpr(c, node.call)
+    local saved = self.free; self:ceTop(node.call); self.free = saved
 
   elseif k == "Return" then
-    if #node.values == 0 then fail(c) end       -- bare return: laktawan
-    if #node.values > 1 then fail(c) end        -- multi-return: hindi pa
-    local r = compileExpr(c, node.values[1])
-    emit(c, OP.RETURN, r)
+    if #node.values == 0 then self:emit(23)
+    elseif #node.values == 1 then
+      local saved = self.free; local r = self:ceTop(node.values[1]); self:emit(22, r); self.free = saved
+    else fail() end
 
   elseif k == "If" then
     local endJumps = {}
     for _, cl in ipairs(node.clauses) do
-      local cond = compileExpr(c, cl.cond)
-      local skip = emitJmpIfNot(c, cond)
-      pushScope(c); compileBlock(c, cl.body); popScope(c)
-      table.insert(endJumps, emitJmp(c))
-      patch(c, skip)
+      local saved = self.free
+      local cond = self:ceTop(cl.cond)
+      local skip = self:emitJmpIfNot(cond)
+      self.free = saved
+      self:pushScope(); self:compileBlock(cl.body); self:popScope()
+      table.insert(endJumps, self:emitJmp())
+      self:patch(skip)
     end
-    if node.elseBody then pushScope(c); compileBlock(c, node.elseBody); popScope(c) end
-    for _, j in ipairs(endJumps) do patch(c, j) end
+    if node.elseBody then self:pushScope(); self:compileBlock(node.elseBody); self:popScope() end
+    for _, j in ipairs(endJumps) do self:patch(j) end
 
   elseif k == "While" then
-    local top = here(c)
-    local cond = compileExpr(c, node.cond)
-    local exit = emitJmpIfNot(c, cond)
-    pushScope(c); compileBlock(c, node.body); popScope(c)
-    patchTo(c, emitJmp(c), top)
-    patch(c, exit)
+    local top = self:here() + 1
+    local saved = self.free
+    local cond = self:ceTop(node.cond)
+    local exit = self:emitJmpIfNot(cond)
+    self.free = saved
+    self:pushScope(); self:compileBlock(node.body); self:popScope()
+    self:patchTo(self:emitJmp(), top)
+    self:patch(exit)
 
   elseif k == "NumericFor" then
-    pushScope(c)
-    local v = declare(c, node.var)
-    local startR = compileExpr(c, node.startExpr); emit(c, OP.MOVE, v, startR)
-    local stopR = compileExpr(c, node.stopExpr)
-    local stepR
-    if node.stepExpr then stepR = compileExpr(c, node.stepExpr)
-    else stepR = alloc(c); emit(c, OP.LOADK, stepR, addK(c, 1)) end
-    local top = here(c)
-    local cmp = alloc(c); emit(c, OP.LE, cmp, v, stopR)
-    local exit = emitJmpIfNot(c, cmp)
-    compileBlock(c, node.body)
-    local nv = alloc(c); emit(c, OP.ADD, nv, v, stepR); emit(c, OP.MOVE, v, nv)
-    patchTo(c, emitJmp(c), top)
-    patch(c, exit)
-    popScope(c)
+    self:pushScope()
+    local v = self:declare(node.var)
+    local saved = self.free
+    local st = self:ceTop(node.startExpr); self:emit(2, v, st); self.free = saved
+    local stopReg = self:declare("(stop)")
+    local s1 = self:ceTop(node.stopExpr); self:emit(2, stopReg, s1); self.free = self.nlocals
+    local stepReg = self:declare("(step)")
+    if node.stepExpr then
+      local s2 = self:ceTop(node.stepExpr); self:emit(2, stepReg, s2); self.free = self.nlocals
+    else
+      self:emit(1, stepReg, self:addK(1))
+    end
+    local top = self:here() + 1
+    local saved2 = self.free
+    local cmp = self:reserve(1); self:emit(16, cmp, v, stopReg)
+    local exit = self:emitJmpIfNot(cmp)
+    self.free = saved2
+    self:compileBlock(node.body)
+    self:emit(5, v, v, stepReg)
+    self:patchTo(self:emitJmp(), top)
+    self:patch(exit)
+    self:popScope()
+
+  elseif k == "Do" then
+    self:pushScope(); self:compileBlock(node.body); self:popScope()
 
   else
-    fail(c)  -- LocalFunction, FunctionDeclaration, Repeat, GenericFor, Do, Break
+    fail()
   end
 end
 
-compileBlock = function(c, statements)
-  for _, stmt in ipairs(statements) do compileStmt(c, stmt) end
+function Compiler:compileBlock(statements)
+  for _, stmt in ipairs(statements) do self:compileStmt(stmt); self.free = self.nlocals end
 end
 
--- ===== Builder: gumawa ng Raw node na __vmrun(code, K) =====
+compileFunction = function(parent, params, body)
+  local c = newCompiler(parent)
+  for _, p in ipairs(params) do if p == "..." then fail() end; c:declare(p) end
+  c:compileBlock(body)
+  c:emit(23)
+  return addProto({ code = c.code, K = c.K, upvals = c.upvals, boxed = c.boxed })
+end
 
-local function buildVMNode(c, paramNames)
-  local codeStr = "{" .. table.concat(c.code, ",") .. "}"
+-- ===== Serialize proto tree -> Lua data literal =====
+
+local function serializeK(K)
   local parts = {}
-  for _, e in ipairs(c.K) do
+  for _, e in ipairs(K) do
     if e.t == "number" then table.insert(parts, tostring(e.v))
     elseif e.t == "string" then table.insert(parts, string.format("%q", e.v))
     elseif e.t == "boolean" then table.insert(parts, tostring(e.v)) end
   end
-  local constStr = "{" .. table.concat(parts, ",") .. "}"
-  -- ang function params ay ipinapasa bilang karagdagang argumento sa __vmrun,
-  -- na maglalagay sa kanila sa registers 0,1,2,... bago tumakbo ang bytecode.
-  local paramList = ""
-  if paramNames and #paramNames > 0 then
-    paramList = "," .. table.concat(paramNames, ",")
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+local function serializeBoxed(boxed)
+  local parts = {}
+  for reg in pairs(boxed) do table.insert(parts, "[" .. reg .. "]=true") end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+local function serializeUpvals(ups)
+  local parts = {}
+  for _, u in ipairs(ups) do
+    if u.fromLocal ~= nil then table.insert(parts, "{l=" .. u.fromLocal .. "}")
+    else table.insert(parts, "{u=" .. u.fromUpval .. "}") end
   end
-  return "__vmrun(" .. codeStr .. "," .. constStr .. paramList .. ")"
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+local function serializeProtos()
+  local parts = {}
+  for _, p in ipairs(protos) do
+    table.insert(parts, "{c={" .. table.concat(p.code, ",") .. "},k=" .. serializeK(p.K)
+      .. ",u=" .. serializeUpvals(p.upvals) .. ",b=" .. serializeBoxed(p.boxed) .. "}")
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
 end
 
--- Subukang i-VM ang isang buong function body (o top-level block).
--- Kailangang MAY exactly one Return sa dulo para maging expression-able? Hindi â€”
--- gumagana rin bilang statement na itinatapon ang return. Pero para ligtas,
--- ini-VM lang natin ang mga body na nagtatapos sa Return (function bodies) O
--- puro statement (top-level, walang return).
-local function tryCompileBlock(statements, params)
-  local c = newCompiler()
-  -- i-declare ang mga function parameter bilang unang registers (R[0], R[1], ...)
-  -- para tumugma sa __vmrun na naglalagay ng passed args doon.
-  local paramNames = {}
-  if params then
-    for _, p in ipairs(params) do
-      if p == "..." then return nil end   -- varargs: hindi pa suportado
-      declare(c, p)
-      table.insert(paramNames, p)
-    end
-  end
-  local ok = pcall(function() compileBlock(c, statements) end)
-  if ok and c.ok and #c.code > 0 then
-    return buildVMNode(c, paramNames)
-  end
-  return nil
-end
-
--- ===== Traversal: palitan ang mga function body ng VM call =====
-
-local walkBlock, walkStatement
-
--- Subukang i-VM ang isang function body. Kung kaya, palitan ang body ng
--- iisang statement na: return __vmrun(...) O CallStatement(__vmrun(...)).
-local function tryVMFunctionBody(bodyStmts, params)
-  -- kung ang huling statement ay Return, ang buong body ay expression-producing
-  local last = bodyStmts[#bodyStmts]
-  local vmText = tryCompileBlock(bodyStmts, params)
-  if not vmText then return nil end
-
-  if last and last.kind == "Return" then
-    -- ang __vmrun ang nagbabalik ng return value
-    return { { kind = "Return", values = { { kind = "Raw", text = vmText } } } }
-  else
-    -- puro side-effect: tawagin lang
-    return { { kind = "CallStatement", call = { kind = "Raw", text = vmText } } }
-  end
-end
-
-walkStatement = function(node)
-  local k = node.kind
-  if k == "LocalFunction" then
-    local vm = tryVMFunctionBody(node.func.body, node.func.params)
-    if vm then node.func.body = vm else walkBlock(node.func.body) end
-  elseif k == "FunctionDeclaration" then
-    local vm = tryVMFunctionBody(node.func.body, node.func.params)
-    if vm then node.func.body = vm else walkBlock(node.func.body) end
-  elseif k == "If" then
-    for _, cl in ipairs(node.clauses) do walkBlock(cl.body) end
-    if node.elseBody then walkBlock(node.elseBody) end
-  elseif k == "While" then walkBlock(node.body)
-  elseif k == "Repeat" then walkBlock(node.body)
-  elseif k == "Do" then walkBlock(node.body)
-  elseif k == "NumericFor" then walkBlock(node.body)
-  elseif k == "GenericFor" then walkBlock(node.body)
-  end
-end
-
-walkBlock = function(statements)
-  for _, stmt in ipairs(statements) do walkStatement(stmt) end
+function VM.transform(ast)
+  resetProtos()
+  local ok, res = pcall(function()
+    local mainC = newCompiler(nil)
+    mainC:compileBlock(ast.body)
+    mainC:emit(23)
+    return addProto({ code = mainC.code, K = mainC.K, upvals = mainC.upvals, boxed = mainC.boxed })
+  end)
+  if not ok then VM._payload = nil; return ast end
+  VM._payload = { protoData = serializeProtos(), mainIndex = res }
+  ast.body = { { kind = "CallStatement", call = { kind = "Raw", text = "__vmmain()" } } }
+  return ast
 end
 
 -- ===== Interpreter prelude =====
 
 function VM.prelude()
+  if not VM._payload then return "" end
   local L = {
-    "local function __vmrun(code, K, ...)",
+    "local __protos = " .. VM._payload.protoData,
+    "local __exec, __mkclosure",
+    "__exec = function(proto, upvals, args)",
+    "  local code = proto.c",
+    "  local K = proto.k",
+    "  local boxed = proto.b",
     "  local R = {}",
-    "  local __args = {...}",
-    "  for __p = 1, select('#', ...) do R[__p - 1] = __args[__p] end",
+    "  local cells = {}",
+    "  for r in pairs(boxed) do cells[r] = { v = nil } end",
+    "  local function gR(r) if boxed[r] then return cells[r].v else return R[r] end end",
+    "  local function sR(r, val) if boxed[r] then cells[r].v = val else R[r] = val end end",
+    "  for p = 1, #args do sR(p-1, args[p]) end",
     "  local i = 1",
     "  local n = #code",
     "  while i <= n do",
     "    local op = code[i]; i = i + 1",
-    "    if op == 1 then R[code[i]] = K[code[i+1]]; i = i + 2",              -- LOADK
-    "    elseif op == 2 then R[code[i]] = R[code[i+1]]; i = i + 2",         -- MOVE
-    "    elseif op == 3 then R[code[i]] = _ENV[K[code[i+1]]]; i = i + 2",   -- GETGLOBAL
-    "    elseif op == 4 then R[code[i]] = R[code[i+1]] + R[code[i+2]]; i = i + 3",   -- ADD
-    "    elseif op == 5 then R[code[i]] = R[code[i+1]] - R[code[i+2]]; i = i + 3",   -- SUB
-    "    elseif op == 6 then R[code[i]] = R[code[i+1]] * R[code[i+2]]; i = i + 3",   -- MUL
-    "    elseif op == 7 then R[code[i]] = R[code[i+1]] / R[code[i+2]]; i = i + 3",   -- DIV
-    "    elseif op == 8 then R[code[i]] = R[code[i+1]] % R[code[i+2]]; i = i + 3",   -- MOD
-    "    elseif op == 9 then R[code[i]] = R[code[i+1]] ^ R[code[i+2]]; i = i + 3",   -- POW
-    "    elseif op == 10 then R[code[i]] = R[code[i+1]] .. R[code[i+2]]; i = i + 3", -- CONCAT
-    "    elseif op == 11 then R[code[i]] = R[code[i+1]] == R[code[i+2]]; i = i + 3", -- EQ
-    "    elseif op == 12 then R[code[i]] = R[code[i+1]] ~= R[code[i+2]]; i = i + 3", -- NE
-    "    elseif op == 13 then R[code[i]] = R[code[i+1]] < R[code[i+2]]; i = i + 3",  -- LT
-    "    elseif op == 14 then R[code[i]] = R[code[i+1]] > R[code[i+2]]; i = i + 3",  -- GT
-    "    elseif op == 15 then R[code[i]] = R[code[i+1]] <= R[code[i+2]]; i = i + 3", -- LE
-    "    elseif op == 16 then R[code[i]] = R[code[i+1]] >= R[code[i+2]]; i = i + 3", -- GE
-    "    elseif op == 17 then R[code[i]] = -R[code[i+1]]; i = i + 2",       -- NEG
-    "    elseif op == 18 then R[code[i]] = not R[code[i+1]]; i = i + 2",    -- NOT
-    "    elseif op == 19 then R[code[i]] = #R[code[i+1]]; i = i + 2",       -- LEN
-    "    elseif op == 20 then",                                            -- CALL
+    "    if op == 1 then sR(code[i], K[code[i+1]]); i = i + 2",
+    "    elseif op == 2 then sR(code[i], gR(code[i+1])); i = i + 2",
+    "    elseif op == 3 then sR(code[i], _ENV[K[code[i+1]]]); i = i + 2",
+    "    elseif op == 4 then _ENV[K[code[i+1]]] = gR(code[i]); i = i + 2",
+    "    elseif op == 5 then sR(code[i], gR(code[i+1]) + gR(code[i+2])); i = i + 3",
+    "    elseif op == 6 then sR(code[i], gR(code[i+1]) - gR(code[i+2])); i = i + 3",
+    "    elseif op == 7 then sR(code[i], gR(code[i+1]) * gR(code[i+2])); i = i + 3",
+    "    elseif op == 8 then sR(code[i], gR(code[i+1]) / gR(code[i+2])); i = i + 3",
+    "    elseif op == 9 then sR(code[i], gR(code[i+1]) % gR(code[i+2])); i = i + 3",
+    "    elseif op == 10 then sR(code[i], gR(code[i+1]) ^ gR(code[i+2])); i = i + 3",
+    "    elseif op == 11 then sR(code[i], gR(code[i+1]) .. gR(code[i+2])); i = i + 3",
+    "    elseif op == 12 then sR(code[i], gR(code[i+1]) == gR(code[i+2])); i = i + 3",
+    "    elseif op == 13 then sR(code[i], gR(code[i+1]) ~= gR(code[i+2])); i = i + 3",
+    "    elseif op == 14 then sR(code[i], gR(code[i+1]) < gR(code[i+2])); i = i + 3",
+    "    elseif op == 15 then sR(code[i], gR(code[i+1]) > gR(code[i+2])); i = i + 3",
+    "    elseif op == 16 then sR(code[i], gR(code[i+1]) <= gR(code[i+2])); i = i + 3",
+    "    elseif op == 17 then sR(code[i], gR(code[i+1]) >= gR(code[i+2])); i = i + 3",
+    "    elseif op == 18 then sR(code[i], -gR(code[i+1])); i = i + 2",
+    "    elseif op == 19 then sR(code[i], not gR(code[i+1])); i = i + 2",
+    "    elseif op == 20 then sR(code[i], #gR(code[i+1])); i = i + 2",
+    "    elseif op == 21 then",
     "      local base = code[i]; local argc = code[i+1]; i = i + 2",
-    "      local fn = R[base]",
-    "      local args = {}",
-    "      for a = 1, argc do args[a] = R[base + a] end",
-    "      R[base] = fn(table.unpack(args))",
-    "    elseif op == 21 then return R[code[i]]",                          -- RETURN
-    "    elseif op == 22 then i = code[i]",                                -- JMP
-    "    elseif op == 23 then",                                           -- JMPIFNOT
+    "      local fn = gR(base)",
+    "      local a = {}",
+    "      for j = 1, argc do a[j] = gR(base + j) end",
+    "      sR(base, fn(table.unpack(a, 1, argc)))",
+    "    elseif op == 22 then return gR(code[i])",
+    "    elseif op == 23 then return",
+    "    elseif op == 24 then i = code[i]",
+    "    elseif op == 25 then",
     "      local reg = code[i]; local target = code[i+1]; i = i + 2",
-    "      if not R[reg] then i = target end",
+    "      if not gR(reg) then i = target end",
+    "    elseif op == 26 then sR(code[i], __mkclosure(__protos[code[i+1]], cells, upvals)); i = i + 2",
+    "    elseif op == 27 then sR(code[i], upvals[code[i+1]].v); i = i + 2",
+    "    elseif op == 28 then upvals[code[i+1]].v = gR(code[i]); i = i + 2",
     "    end",
     "  end",
     "end",
+    "__mkclosure = function(proto, parentCells, parentUpvals)",
+    "  local captured = {}",
+    "  for idx = 1, #proto.u do",
+    "    local spec = proto.u[idx]",
+    "    if spec.l ~= nil then captured[idx] = parentCells[spec.l]",
+    "    else captured[idx] = parentUpvals[spec.u] end",
+    "  end",
+    "  return function(...) return __exec(proto, captured, {...}) end",
+    "end",
+    "local function __vmmain() return __exec(__protos[" .. VM._payload.mainIndex .. "], {}, {}) end",
   }
   return table.concat(L, "\n") .. "\n"
-end
-
-function VM.transform(ast)
-  walkBlock(ast.body)
-  return ast
 end
 
 return VM
