@@ -492,6 +492,8 @@ end
 function Parser:parseBlock()
   local statements = {}
   while true do
+    -- Lua/Luau: opsyonal na ";" separator â€” laktawan ang stray semicolons
+    while self:accept("OPERATOR", ";") do end
     local tok = self:peek()
     if tok.type == "EOF"
        or (tok.type == "KEYWORD" and (tok.value == "end" or tok.value == "else"
