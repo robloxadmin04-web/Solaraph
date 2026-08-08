@@ -1,5 +1,7 @@
 -- generator.lua
 -- Code generator: AST -> Lua source. Normal at minify mode.
+-- FIX: nag-wrap ng parentheses ang BinaryOp/UnaryOp para hindi masira ang
+-- precedence kapag sinusundan ng index/method/call, hal. (a - b).Magnitude
 
 local Generator = {}
 Generator.__index = Generator
@@ -38,14 +40,16 @@ function Generator:genExpr(node)
     return node.text
 
   elseif k == "UnaryOp" then
+    -- i-paren para ligtas sa precedence:  (-x).foo ,  (not a) and b
     if node.op == "not" then
-      return "not " .. self:genExpr(node.operand)
+      return "(not " .. self:genExpr(node.operand) .. ")"
     else
-      return node.op .. self:genExpr(node.operand)
+      return "(" .. node.op .. self:genExpr(node.operand) .. ")"
     end
 
   elseif k == "BinaryOp" then
-    return self:genExpr(node.left) .. " " .. node.op .. " " .. self:genExpr(node.right)
+    -- i-paren para ligtas sa precedence:  (a - b).Magnitude ,  (a + b) * c
+    return "(" .. self:genExpr(node.left) .. " " .. node.op .. " " .. self:genExpr(node.right) .. ")"
 
   elseif k == "Call" then
     local args = {}
@@ -127,7 +131,7 @@ function Generator:genStatement(node)
     -- ang target ay Index/Variable; kung method, tanggalin ang implicit self sa display
     local params = node.func.params
     if node.isMethod then
-      -- ang unang param ay "self" (implicit sa : syntax) — tanggalin sa output
+      -- ang unang param ay "self" (implicit sa : syntax) â€” tanggalin sa output
       local shown = {}
       for i = 2, #params do table.insert(shown, params[i]) end
       -- gamitin ang : syntax: function obj:method(...)
