@@ -218,7 +218,7 @@ end
 
 -- ===== Builder: gumawa ng Raw node na __vmrun(code, K) =====
 
-local function buildVMNode(c)
+local function buildVMNode(c, paramNames)
   local codeStr = "{" .. table.concat(c.code, ",") .. "}"
   local parts = {}
   for _, e in ipairs(c.K) do
@@ -227,7 +227,13 @@ local function buildVMNode(c)
     elseif e.t == "boolean" then table.insert(parts, tostring(e.v)) end
   end
   local constStr = "{" .. table.concat(parts, ",") .. "}"
-  return "__vmrun(" .. codeStr .. "," .. constStr .. ")"
+  -- ang function params ay ipinapasa bilang karagdagang argumento sa __vmrun,
+  -- na maglalagay sa kanila sa registers 0,1,2,... bago tumakbo ang bytecode.
+  local paramList = ""
+  if paramNames and #paramNames > 0 then
+    paramList = "," .. table.concat(paramNames, ",")
+  end
+  return "__vmrun(" .. codeStr .. "," .. constStr .. paramList .. ")"
 end
 
 -- Subukang i-VM ang isang buong function body (o top-level block).
@@ -235,11 +241,21 @@ end
 -- gumagana rin bilang statement na itinatapon ang return. Pero para ligtas,
 -- ini-VM lang natin ang mga body na nagtatapos sa Return (function bodies) O
 -- puro statement (top-level, walang return).
-local function tryCompileBlock(statements)
+local function tryCompileBlock(statements, params)
   local c = newCompiler()
+  -- i-declare ang mga function parameter bilang unang registers (R[0], R[1], ...)
+  -- para tumugma sa __vmrun na naglalagay ng passed args doon.
+  local paramNames = {}
+  if params then
+    for _, p in ipairs(params) do
+      if p == "..." then return nil end   -- varargs: hindi pa suportado
+      declare(c, p)
+      table.insert(paramNames, p)
+    end
+  end
   local ok = pcall(function() compileBlock(c, statements) end)
   if ok and c.ok and #c.code > 0 then
-    return buildVMNode(c)
+    return buildVMNode(c, paramNames)
   end
   return nil
 end
@@ -250,10 +266,10 @@ local walkBlock, walkStatement
 
 -- Subukang i-VM ang isang function body. Kung kaya, palitan ang body ng
 -- iisang statement na: return __vmrun(...) O CallStatement(__vmrun(...)).
-local function tryVMFunctionBody(bodyStmts)
+local function tryVMFunctionBody(bodyStmts, params)
   -- kung ang huling statement ay Return, ang buong body ay expression-producing
   local last = bodyStmts[#bodyStmts]
-  local vmText = tryCompileBlock(bodyStmts)
+  local vmText = tryCompileBlock(bodyStmts, params)
   if not vmText then return nil end
 
   if last and last.kind == "Return" then
@@ -268,10 +284,10 @@ end
 walkStatement = function(node)
   local k = node.kind
   if k == "LocalFunction" then
-    local vm = tryVMFunctionBody(node.func.body)
+    local vm = tryVMFunctionBody(node.func.body, node.func.params)
     if vm then node.func.body = vm else walkBlock(node.func.body) end
   elseif k == "FunctionDeclaration" then
-    local vm = tryVMFunctionBody(node.func.body)
+    local vm = tryVMFunctionBody(node.func.body, node.func.params)
     if vm then node.func.body = vm else walkBlock(node.func.body) end
   elseif k == "If" then
     for _, cl in ipairs(node.clauses) do walkBlock(cl.body) end
@@ -292,8 +308,10 @@ end
 
 function VM.prelude()
   local L = {
-    "local function __vmrun(code, K)",
+    "local function __vmrun(code, K, ...)",
     "  local R = {}",
+    "  local __args = {...}",
+    "  for __p = 1, select('#', ...) do R[__p - 1] = __args[__p] end",
     "  local i = 1",
     "  local n = #code",
     "  while i <= n do",
