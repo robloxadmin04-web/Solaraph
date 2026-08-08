@@ -1,6 +1,6 @@
 -- solaraph.lua
 -- CLI: lua solaraph.lua <input.lua> [output.lua] [flags]
--- Flags: --no-minify --no-strings --no-numbers --no-rename --no-fold --no-dead --no-flatten
+-- Flags: --no-minify --no-strings --no-numbers --no-rename --no-fold --no-dead --no-flatten --no-vm
 
 local Lexer     = require("lexer")
 local Parser    = require("parser")
@@ -10,6 +10,7 @@ local CFlatten  = require("cflatten")
 local Renamer   = require("renamer")
 local NumEnc    = require("numenc")
 local StringEnc = require("stringenc")
+local VM        = require("vm")
 local Generator = require("generator")
 
 math.randomseed(os.time())
@@ -17,8 +18,8 @@ math.randomseed(os.time())
 -- ===== Argumento at flags =====
 local inputPath  = arg[1]
 local outputPath = nil
-local opts = { minify = true, rename = true, strings = true,
-               numbers = true, fold = true, dead = true, flatten = true }
+local opts = { minify = true, rename = true, strings = true, numbers = true,
+               fold = true, dead = true, flatten = true, vm = true }
 
 for i = 2, #arg do
   local a = arg[i]
@@ -29,6 +30,7 @@ for i = 2, #arg do
   elseif a == "--no-fold"    then opts.fold    = false
   elseif a == "--no-dead"    then opts.dead    = false
   elseif a == "--no-flatten" then opts.flatten = false
+  elseif a == "--no-vm"      then opts.vm      = false
   elseif a:sub(1, 2) ~= "--" then outputPath = a
   end
 end
@@ -36,7 +38,7 @@ end
 if not inputPath then
   print("Solaraph - Lua obfuscator")
   print("Gamit: lua solaraph.lua <input.lua> [output.lua] [flags]")
-  print("Flags: --no-minify --no-strings --no-numbers --no-rename --no-fold --no-dead --no-flatten")
+  print("Flags: --no-minify --no-strings --no-numbers --no-rename --no-fold --no-dead --no-flatten --no-vm")
   os.exit(1)
 end
 
@@ -62,14 +64,17 @@ local ok, result = pcall(function()
   if opts.flatten then ast = CFlatten.flatten(ast) end    -- 2. control-flow flattening
   if opts.rename  then ast = Renamer.rename(ast) end      -- 3. rename locals
   if opts.numbers then ast = NumEnc.obfuscate(ast) end    -- 4. obfuscate numbers
-  if opts.strings then ast = StringEnc.encrypt(ast) end   -- 5. encrypt strings
-  if opts.dead    then ast = DeadCode.inject(ast) end     -- 6. dead code (HULI)
+  if opts.vm      then ast = VM.transform(ast) end        -- 5. VM-based (pagkatapos ng rename)
+  if opts.strings then ast = StringEnc.encrypt(ast) end   -- 6. encrypt strings
+  if opts.dead    then ast = DeadCode.inject(ast) end     -- 7. dead code (HULI)
 
   local body = Generator.generate(ast, opts.minify)
-  if opts.strings then
-    return StringEnc.prelude() .. body
-  end
-  return body
+
+  -- idikit ang mga prelude na kailangan (VM muna, tapos string decoder)
+  local prelude = ""
+  if opts.vm      then prelude = prelude .. VM.prelude() end
+  if opts.strings then prelude = prelude .. StringEnc.prelude() end
+  return prelude .. body
 end)
 
 if not ok then
@@ -96,6 +101,7 @@ print("  Passes: fold=" .. tostring(opts.fold)
       .. " flatten=" .. tostring(opts.flatten)
       .. " rename=" .. tostring(opts.rename)
       .. " numbers=" .. tostring(opts.numbers)
+      .. " vm=" .. tostring(opts.vm)
       .. " strings=" .. tostring(opts.strings)
       .. " dead=" .. tostring(opts.dead)
       .. " minify=" .. tostring(opts.minify))
