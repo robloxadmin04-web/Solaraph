@@ -1,6 +1,7 @@
 -- test.lua
 local Lexer = require("lexer")
 local Parser = require("parser")
+local Renamer = require("renamer")
 local Generator = require("generator")
 
 local code = [[
@@ -20,22 +21,23 @@ else
 end
 ]]
 
--- Buong pipeline: source -> tokens -> tree -> source ulit
+-- Buong pipeline: source -> tokens -> tree -> RENAME -> source
 local tokens = Lexer.tokenize(code)
 local ast = Parser.parse(tokens)
+ast = Renamer.rename(ast)           -- <-- ANG OBFUSCATION
 local output = Generator.generate(ast)
 
 print("===== ORIHINAL =====")
 print(code)
-print("===== GENERATED =====")
+print("===== OBFUSCATED =====")
 print(output)
 
--- ANG TOTOONG TEST: tumatakbo pa ba ang generated code?
-print("===== SUBUKANG PATAKBUHIN ANG GENERATED =====")
+-- Test: tumatakbo pa ba nang tama?
+print("===== PATAKBUHIN ANG OBFUSCATED =====")
 local fn = load(output)
 if fn then
   fn()
-  print("(gumana ang generated code!)")
+  print("(gumana ang obfuscated code!)")
 else
-  print("MALI: hindi valid ang generated code")
+  print("MALI: hindi valid ang obfuscated code")
 end
