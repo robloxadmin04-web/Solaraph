@@ -1,6 +1,7 @@
 -- stringenc.lua
 -- Obfuscation pass: string encryption (XOR + decoder prelude).
 -- Updated para sa bagong AST: tables, methods, multiple values.
+-- Luau/Roblox-safe: bit32.bxor sa halip na "~" (Lua 5.1 base, walang "~" operator).
 
 local StringEnc = {}
 
@@ -19,11 +20,28 @@ local function unquote(raw)
   return raw
 end
 
+-- Luau/Lua5.1-safe XOR: gamitin ang bit32.bxor sa halip na "~"
+local function bxor(a, b)
+  if bit32 and bit32.bxor then
+    return bit32.bxor(a, b)
+  end
+  -- fallback para sa plain Lua 5.1 (walang bit32) o kung saan naka-off
+  local result, bitval = 0, 1
+  while a > 0 or b > 0 do
+    local abit, bbit = a % 2, b % 2
+    if abit ~= bbit then result = result + bitval end
+    a = (a - abit) / 2
+    b = (b - bbit) / 2
+    bitval = bitval * 2
+  end
+  return result
+end
+
 local function encode(str)
   local bytes = {}
   for i = 1, #str do
     local b = string.byte(str, i)
-    table.insert(bytes, tostring(b ~ XOR_KEY))
+    table.insert(bytes, tostring(bxor(b, XOR_KEY)))
   end
   return table.concat(bytes, ",")
 end
@@ -101,9 +119,18 @@ end
 
 function StringEnc.prelude()
   return
+    "local __bxor = (bit32 and bit32.bxor) or (bit and bit.bxor) or function(a,b)\n" ..
+    "  local r,c=0,1\n" ..
+    "  while a>0 or b>0 do\n" ..
+    "    local x,y=a%2,b%2\n" ..
+    "    if x~=y then r=r+c end\n" ..
+    "    a=(a-x)/2; b=(b-y)/2; c=c*2\n" ..
+    "  end\n" ..
+    "  return r\n" ..
+    "end\n" ..
     "local function __dec(t)\n" ..
     "  local s = {}\n" ..
-    "  for i = 1, #t do s[i] = string.char(t[i] ~ " .. XOR_KEY .. ") end\n" ..
+    "  for i = 1, #t do s[i] = string.char(__bxor(t[i], " .. XOR_KEY .. ")) end\n" ..
     "  return table.concat(s)\n" ..
     "end\n"
 end
