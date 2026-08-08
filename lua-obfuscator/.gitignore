@@ -1,0 +1,7 @@
+# Lua
+*.luac
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
