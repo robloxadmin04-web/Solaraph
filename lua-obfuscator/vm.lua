@@ -94,7 +94,9 @@ compileExpr = function(c, node)
     else c.ok = false end
 
   elseif k == "Variable" then
-    emit(c, OP.PUSHV, addConst(c, { t = "s", v = node.name }))
+    -- HINDI suportado: ang VM ay walang access sa local scope, kaya iniiwan
+    -- ang variable reads bilang normal na code.
+    c.ok = false
 
   elseif k == "UnaryOp" then
     compileExpr(c, node.operand)
@@ -111,11 +113,8 @@ compileExpr = function(c, node)
     emit(c, opc)
 
   elseif k == "Call" then
-    -- callee ay dapat simpleng Variable (para ma-lookup sa runtime env)
-    if node.callee.kind ~= "Variable" then c.ok = false; return end
-    compileExpr(c, node.callee)
-    for _, a in ipairs(node.args) do compileExpr(c, a) end
-    emit(c, OP.CALL, #node.args)
+    -- HINDI suportado: nangangailangan ng scope lookup para sa callee.
+    c.ok = false
 
   else
     -- Table, MethodCall, Index, Function, Vararg, Raw: hindi pa suportado
