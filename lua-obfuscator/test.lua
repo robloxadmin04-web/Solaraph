@@ -2,10 +2,24 @@
 local Lexer = require("lexer")
 local Parser = require("parser")
 
--- Helper: i-print ang AST nang naka-indent
 local function printAST(node, indent)
   indent = indent or ""
-  if node.kind == "Number" then
+
+  if node.kind == "Program" then
+    print(indent .. "Program:")
+    for _, stmt in ipairs(node.body) do
+      printAST(stmt, indent .. "  ")
+    end
+
+  elseif node.kind == "LocalAssignment" then
+    print(indent .. "LocalAssignment: " .. node.name)
+    printAST(node.value, indent .. "  ")
+
+  elseif node.kind == "Assignment" then
+    print(indent .. "Assignment: " .. node.name)
+    printAST(node.value, indent .. "  ")
+
+  elseif node.kind == "Number" then
     print(indent .. "Number: " .. node.value)
   elseif node.kind == "String" then
     print(indent .. "String: " .. node.value)
@@ -23,10 +37,12 @@ local function printAST(node, indent)
   end
 end
 
-local code = "a == 1 and b or not c"
+local code = [[
+local x = 1 + 2 * 3
+local name = "Solaraph"
+x = x + 1
+]]
+
 local tokens = Lexer.tokenize(code)
 local ast = Parser.parse(tokens)
-
-print("Expression: " .. code)
-print("---")
 printAST(ast)
