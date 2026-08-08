@@ -1,235 +1,286 @@
 -- vm.lua
--- Obfuscation pass: VM-based obfuscation (subset).
+-- Obfuscation pass: FULL-PROGRAM VM (register-based, Hakbang 1+2).
 --
--- IDEA: Sa halip na i-emit ang isang expression bilang normal na Lua source,
--- kino-compile ito sa BYTECODE para sa isang maliit na stack machine, tapos
--- pinapalitan ang expression ng isang tawag sa VM interpreter:
+-- Kino-compile ang mga block ng code sa REGISTER-BASED bytecode para sa isang
+-- maliit na VM, tapos pinapalitan ang orihinal ng isang tawag sa interpreter:
 --
---    x = (a + b) * 2
---      -->
---    x = __vm({...bytecode...}, {...constants...})
+--    <mga statement>  -->  __vmrun({...bytecode...}, {...constants...})
 --
--- Ang __vm interpreter (prelude) ang nagpapatakbo ng bytecode gamit ang value
--- stack. Parehong resulta, pero nawala ang orihinal na anyo ng expression â€”
--- ito na ang pinaka-malakas na layer dahil kailangang unawain ng attacker ang
--- buong VM bago mabasa kahit isang linya.
+-- KAYA NITO (kabaligtaran ng lumang stack VM na constants-lang):
+--   * local variables (registers/slots)
+--   * arithmetic, concat, comparison, unary
+--   * function calls na may tamang arguments
+--   * global lookup (print, pairs, atbp.)
+--   * if / elseif / else, while, numeric for  (via jumps)
 --
--- SAKLAW (LIGTAS/subset): kino-compile lang ang mga expression na PURONG
--- kaya ng stack machine â€” numbers, strings, booleans, variable reads,
--- unary/binary ops, at function calls kung saan simple ang callee. Kapag may
--- nakita itong hindi pa suportado (tables, method calls, varargs, function
--- literals, index/field access), IWINAN ang buong expression na buo â€” kaya
--- garantisadong hindi nasisira ang code, lumiliit lang ang saklaw.
+-- HINDI PA (susunod na hakbang â€” closures):
+--   * nested function definitions (local function / function ... end)
+--   * generic for, repeat, method calls, multiple assignment >1, varargs
+--   * tables, index/field access
+-- Kapag may nakita nito, IWINAN ang buong block na normal (walang binago),
+-- kaya garantisadong hindi nasisira ang code â€” lumiliit lang ang saklaw.
 --
--- Tumatakbo dapat HULI-HULI sa pipeline (pagkatapos ng rename/numbers) dahil
--- kino-capture nito ang variable NAMES bilang runtime lookup.
+-- Tumatakbo dapat HULI-HULI (pagkatapos ng rename) â€” kino-capture ang GLOBAL
+-- names bilang runtime lookup; ang locals ay nagiging registers.
 
 local VM = {}
 
--- ===== Opcodes (integer para compact) =====
+-- ===== Opcodes =====
 local OP = {
-  PUSHK  = 1,   -- push constant[operand]
-  PUSHV  = 2,   -- push value ng variable na constant[operand] (string name)
-  ADD=3, SUB=4, MUL=5, DIV=6, MOD=7, POW=8, CONCAT=9,
-  EQ=10, NE=11, LT=12, GT=13, LE=14, GE=15,
-  AND=16, OR=17,
-  NEG=18, NOT=19, LEN=20,
-  CALL=21,      -- operand = argc; stack: callee, arg1..argN
-  TRUE=22, FALSE=23, NIL=24,
+  LOADK=1, MOVE=2, GETGLOBAL=3,
+  ADD=4, SUB=5, MUL=6, DIV=7, MOD=8, POW=9, CONCAT=10,
+  EQ=11, NE=12, LT=13, GT=14, LE=15, GE=16,
+  NEG=17, NOT=18, LEN=19,
+  CALL=20,       -- CALL base, argc   -> R[base] = R[base](R[base+1..base+argc])
+  RETURN=21,     -- RETURN reg
+  JMP=22,        -- JMP target
+  JMPIFNOT=23,   -- JMPIFNOT reg, target
 }
 
--- ===== Compiler: expr -> bytecode =====
--- Nagbabalik ng true kung na-compile nang buo; false kung may hindi suportado
--- (sa kasong iyon dapat iwan ng caller ang orihinal na expression).
+-- ===== Compiler (may exception para sa unsupported) =====
 
 local function newCompiler()
-  return { consts = {}, code = {}, ok = true }
+  return {
+    code = {}, K = {}, nextReg = 0,
+    scopes = { {} },
+    ok = true,
+  }
 end
 
-local function addConst(c, value)
-  -- reuse kung existing na (maliit na optimization)
-  for i, v in ipairs(c.consts) do
-    if v.t == value.t and v.v == value.v then return i end
+local function fail(c) c.ok = false; error("__vm_unsupported", 0) end
+
+local function addK(c, v)
+  for i, e in ipairs(c.K) do
+    if e.v == v and e.t == type(v) then return i end
   end
-  table.insert(c.consts, value)
-  return #c.consts
+  table.insert(c.K, { v = v, t = type(v) })
+  return #c.K
 end
 
-local function emit(c, op, operand)
-  table.insert(c.code, op)
-  if operand ~= nil then table.insert(c.code, operand) end
+local function alloc(c) local r = c.nextReg; c.nextReg = r + 1; return r end
+local function pushScope(c) table.insert(c.scopes, {}) end
+local function popScope(c) table.remove(c.scopes) end
+local function declare(c, name) local r = alloc(c); c.scopes[#c.scopes][name] = r; return r end
+local function resolve(c, name)
+  for i = #c.scopes, 1, -1 do
+    local r = c.scopes[i][name]
+    if r ~= nil then return r end
+  end
+  return nil
 end
+local function emit(c, ...) local t = {...}; for _, x in ipairs(t) do table.insert(c.code, x) end end
+local function here(c) return #c.code end
+-- emit ng jump na may placeholder na target; ibalik ang index ng operand
+local function emitJmp(c) emit(c, OP.JMP, 0); return #c.code end
+local function emitJmpIfNot(c, reg) emit(c, OP.JMPIFNOT, reg, 0); return #c.code end
+local function patch(c, idx) c.code[idx] = here(c) end
+local function patchTo(c, idx, target) c.code[idx] = target end
 
 local BINOP = {
-  ["+"]=OP.ADD, ["-"]=OP.SUB, ["*"]=OP.MUL, ["/"]=OP.DIV, ["%"]=OP.MOD,
-  [".."]=OP.CONCAT,
-  ["=="]=OP.EQ, ["~="]=OP.NE, ["<"]=OP.LT, [">"]=OP.GT, ["<="]=OP.LE, [">="]=OP.GE,
-  ["and"]=OP.AND, ["or"]=OP.OR,
+  ["+"]=OP.ADD, ["-"]=OP.SUB, ["*"]=OP.MUL, ["/"]=OP.DIV, ["%"]=OP.MOD, ["^"]=OP.POW,
+  [".."]=OP.CONCAT, ["=="]=OP.EQ, ["~="]=OP.NE,
+  ["<"]=OP.LT, [">"]=OP.GT, ["<="]=OP.LE, [">="]=OP.GE,
 }
 
-local compileExpr
+local compileExpr, compileStmt, compileBlock
 
 compileExpr = function(c, node)
-  if not c.ok then return end
   local k = node.kind
 
   if k == "Number" then
-    local n = tonumber(node.value)
-    if n == nil then c.ok = false; return end
-    emit(c, OP.PUSHK, addConst(c, { t = "n", v = n }))
+    local n = tonumber(node.value); if n == nil then fail(c) end
+    local r = alloc(c); emit(c, OP.LOADK, r, addK(c, n)); return r
 
   elseif k == "String" then
-    -- kailanganin ang unquoted na laman; laktawan kung long-bracket o may escape
-    local raw = node.value
-    local first = raw:sub(1, 1)
-    if first ~= '"' and first ~= "'" then c.ok = false; return end
-    local inner = raw:sub(2, #raw - 1)
-    if inner:find("\\", 1, true) then c.ok = false; return end
-    emit(c, OP.PUSHK, addConst(c, { t = "s", v = inner }))
+    local raw = node.value; local first = raw:sub(1,1)
+    if first ~= '"' and first ~= "'" then fail(c) end
+    local inner = raw:sub(2, #raw-1)
+    if inner:find("\\", 1, true) then fail(c) end
+    local r = alloc(c); emit(c, OP.LOADK, r, addK(c, inner)); return r
 
   elseif k == "Literal" then
-    if node.value == "true" then emit(c, OP.TRUE)
-    elseif node.value == "false" then emit(c, OP.FALSE)
-    elseif node.value == "nil" then emit(c, OP.NIL)
-    else c.ok = false end
+    if node.value == "true" then local r=alloc(c); emit(c,OP.LOADK,r,addK(c,true)); return r
+    elseif node.value == "false" then local r=alloc(c); emit(c,OP.LOADK,r,addK(c,false)); return r
+    else fail(c) end   -- nil: laktawan (walang malinis na K rep)
 
   elseif k == "Variable" then
-    -- HINDI suportado: ang VM ay walang access sa local scope, kaya iniiwan
-    -- ang variable reads bilang normal na code.
-    c.ok = false
-
-  elseif k == "UnaryOp" then
-    compileExpr(c, node.operand)
-    if node.op == "-" then emit(c, OP.NEG)
-    elseif node.op == "not" then emit(c, OP.NOT)
-    elseif node.op == "#" then emit(c, OP.LEN)
-    else c.ok = false end
+    local localReg = resolve(c, node.name)
+    if localReg ~= nil then return localReg end
+    local r = alloc(c); emit(c, OP.GETGLOBAL, r, addK(c, node.name)); return r
 
   elseif k == "BinaryOp" then
-    local opc = BINOP[node.op]
-    if not opc then c.ok = false; return end
-    compileExpr(c, node.left)
-    compileExpr(c, node.right)
-    emit(c, opc)
+    local opc = BINOP[node.op]; if not opc then fail(c) end
+    local a = compileExpr(c, node.left)
+    local b = compileExpr(c, node.right)
+    local r = alloc(c); emit(c, opc, r, a, b); return r
+
+  elseif k == "UnaryOp" then
+    local a = compileExpr(c, node.operand)
+    local r = alloc(c)
+    if node.op == "-" then emit(c, OP.NEG, r, a)
+    elseif node.op == "not" then emit(c, OP.NOT, r, a)
+    elseif node.op == "#" then emit(c, OP.LEN, r, a)
+    else fail(c) end
+    return r
 
   elseif k == "Call" then
-    -- HINDI suportado: nangangailangan ng scope lookup para sa callee.
-    c.ok = false
+    local fnReg = compileExpr(c, node.callee)
+    local argRegs = {}
+    for _, a in ipairs(node.args) do table.insert(argRegs, compileExpr(c, a)) end
+    -- contiguous block: base = fn, base+1..base+argc = args
+    local base = alloc(c); emit(c, OP.MOVE, base, fnReg)
+    for _, ar in ipairs(argRegs) do local slot = alloc(c); emit(c, OP.MOVE, slot, ar) end
+    emit(c, OP.CALL, base, #node.args)
+    return base
 
   else
-    -- Table, MethodCall, Index, Function, Vararg, Raw: hindi pa suportado
-    c.ok = false
+    fail(c)  -- MethodCall, Index, Table, Function, Vararg, Raw: hindi pa
   end
 end
 
--- Bumuo ng Raw node na naglalaman ng __vm(...) na tawag.
-local function buildVMCall(c)
-  -- bytecode array -> "{1,5,2,...}"
-  local codeStr = "{" .. table.concat(c.code, ",") .. "}"
+compileStmt = function(c, node)
+  local k = node.kind
 
-  -- constants -> "{...}" na may tamang Lua literal bawat isa
-  local parts = {}
-  for _, k in ipairs(c.consts) do
-    if k.t == "n" then
-      table.insert(parts, tostring(k.v))
-    elseif k.t == "s" then
-      table.insert(parts, string.format("%q", k.v))
+  if k == "LocalAssignment" then
+    -- suportado lang ang 1:1 o values muna tapos declare
+    local vals = {}
+    if node.values then for _, v in ipairs(node.values) do table.insert(vals, compileExpr(c, v)) end end
+    for i, name in ipairs(node.names) do
+      local r = declare(c, name)
+      if vals[i] ~= nil then emit(c, OP.MOVE, r, vals[i]) end
     end
+
+  elseif k == "Assignment" then
+    -- targets ay dapat simpleng local Variable
+    local vals = {}
+    for _, v in ipairs(node.values) do table.insert(vals, compileExpr(c, v)) end
+    for i, t in ipairs(node.targets) do
+      if t.kind ~= "Variable" then fail(c) end
+      local r = resolve(c, t.name)
+      if r == nil then fail(c) end   -- assignment sa global: hindi pa
+      if vals[i] ~= nil then emit(c, OP.MOVE, r, vals[i]) end
+    end
+
+  elseif k == "CallStatement" then
+    compileExpr(c, node.call)
+
+  elseif k == "Return" then
+    if #node.values == 0 then fail(c) end       -- bare return: laktawan
+    if #node.values > 1 then fail(c) end        -- multi-return: hindi pa
+    local r = compileExpr(c, node.values[1])
+    emit(c, OP.RETURN, r)
+
+  elseif k == "If" then
+    local endJumps = {}
+    for _, cl in ipairs(node.clauses) do
+      local cond = compileExpr(c, cl.cond)
+      local skip = emitJmpIfNot(c, cond)
+      pushScope(c); compileBlock(c, cl.body); popScope(c)
+      table.insert(endJumps, emitJmp(c))
+      patch(c, skip)
+    end
+    if node.elseBody then pushScope(c); compileBlock(c, node.elseBody); popScope(c) end
+    for _, j in ipairs(endJumps) do patch(c, j) end
+
+  elseif k == "While" then
+    local top = here(c)
+    local cond = compileExpr(c, node.cond)
+    local exit = emitJmpIfNot(c, cond)
+    pushScope(c); compileBlock(c, node.body); popScope(c)
+    patchTo(c, emitJmp(c), top)
+    patch(c, exit)
+
+  elseif k == "NumericFor" then
+    pushScope(c)
+    local v = declare(c, node.var)
+    local startR = compileExpr(c, node.startExpr); emit(c, OP.MOVE, v, startR)
+    local stopR = compileExpr(c, node.stopExpr)
+    local stepR
+    if node.stepExpr then stepR = compileExpr(c, node.stepExpr)
+    else stepR = alloc(c); emit(c, OP.LOADK, stepR, addK(c, 1)) end
+    local top = here(c)
+    local cmp = alloc(c); emit(c, OP.LE, cmp, v, stopR)
+    local exit = emitJmpIfNot(c, cmp)
+    compileBlock(c, node.body)
+    local nv = alloc(c); emit(c, OP.ADD, nv, v, stepR); emit(c, OP.MOVE, v, nv)
+    patchTo(c, emitJmp(c), top)
+    patch(c, exit)
+    popScope(c)
+
+  else
+    fail(c)  -- LocalFunction, FunctionDeclaration, Repeat, GenericFor, Do, Break
+  end
+end
+
+compileBlock = function(c, statements)
+  for _, stmt in ipairs(statements) do compileStmt(c, stmt) end
+end
+
+-- ===== Builder: gumawa ng Raw node na __vmrun(code, K) =====
+
+local function buildVMNode(c)
+  local codeStr = "{" .. table.concat(c.code, ",") .. "}"
+  local parts = {}
+  for _, e in ipairs(c.K) do
+    if e.t == "number" then table.insert(parts, tostring(e.v))
+    elseif e.t == "string" then table.insert(parts, string.format("%q", e.v))
+    elseif e.t == "boolean" then table.insert(parts, tostring(e.v)) end
   end
   local constStr = "{" .. table.concat(parts, ",") .. "}"
-
-  return { kind = "Raw", text = "__vm(" .. codeStr .. "," .. constStr .. ")" }
+  return "__vmrun(" .. codeStr .. "," .. constStr .. ")"
 end
 
--- Subukang i-VM ang isang expression. Kung kaya nang buo, ibalik ang bagong
--- Raw node; kung hindi, ibalik ang orihinal (walang binago).
-local function tryVMExpr(node)
-  -- huwag i-VM ang trivial na node (walang saysay balutin ang isang literal/var)
-  if node.kind == "Number" or node.kind == "String"
-     or node.kind == "Literal" or node.kind == "Variable"
-     or node.kind == "Raw" then
-    return node
-  end
+-- Subukang i-VM ang isang buong function body (o top-level block).
+-- Kailangang MAY exactly one Return sa dulo para maging expression-able? Hindi â€”
+-- gumagana rin bilang statement na itinatapon ang return. Pero para ligtas,
+-- ini-VM lang natin ang mga body na nagtatapos sa Return (function bodies) O
+-- puro statement (top-level, walang return).
+local function tryCompileBlock(statements)
   local c = newCompiler()
-  compileExpr(c, node)
-  if c.ok and #c.code > 0 then
-    return buildVMCall(c)
+  local ok = pcall(function() compileBlock(c, statements) end)
+  if ok and c.ok and #c.code > 0 then
+    return buildVMNode(c)
   end
-  return node
+  return nil
 end
 
--- ===== Traversal: palitan ang mga expression sa buong AST =====
+-- ===== Traversal: palitan ang mga function body ng VM call =====
 
 local walkBlock, walkStatement
 
--- I-VM ang isang expression slot: subukan sa buong node; kung hindi kaya,
--- pumasok sa loob para i-VM ang mga sub-expression (partial coverage).
-local function walkExpr(node)
-  if node == nil then return node end
-  -- subukan muna ang buong node
-  local replaced = tryVMExpr(node)
-  if replaced ~= node then return replaced end
+-- Subukang i-VM ang isang function body. Kung kaya, palitan ang body ng
+-- iisang statement na: return __vmrun(...) O CallStatement(__vmrun(...)).
+local function tryVMFunctionBody(bodyStmts)
+  -- kung ang huling statement ay Return, ang buong body ay expression-producing
+  local last = bodyStmts[#bodyStmts]
+  local vmText = tryCompileBlock(bodyStmts)
+  if not vmText then return nil end
 
-  -- hindi na-VM nang buo: pumasok sa mga anak para sa partial coverage
-  local k = node.kind
-  if k == "UnaryOp" then
-    node.operand = walkExpr(node.operand)
-  elseif k == "BinaryOp" then
-    node.left = walkExpr(node.left)
-    node.right = walkExpr(node.right)
-  elseif k == "Call" then
-    node.callee = walkExpr(node.callee)
-    for i, a in ipairs(node.args) do node.args[i] = walkExpr(a) end
-  elseif k == "MethodCall" then
-    node.object = walkExpr(node.object)
-    for i, a in ipairs(node.args) do node.args[i] = walkExpr(a) end
-  elseif k == "Index" then
-    node.object = walkExpr(node.object)
-    if node.index then node.index = walkExpr(node.index) end
-  elseif k == "Table" then
-    for _, f in ipairs(node.fields) do
-      if f.kind == "keyed" then f.key = walkExpr(f.key) end
-      f.value = walkExpr(f.value)
-    end
-  elseif k == "Function" then
-    walkBlock(node.body)
+  if last and last.kind == "Return" then
+    -- ang __vmrun ang nagbabalik ng return value
+    return { { kind = "Return", values = { { kind = "Raw", text = vmText } } } }
+  else
+    -- puro side-effect: tawagin lang
+    return { { kind = "CallStatement", call = { kind = "Raw", text = vmText } } }
   end
-  return node
 end
 
 walkStatement = function(node)
   local k = node.kind
-  if k == "LocalAssignment" then
-    if node.values then for i, v in ipairs(node.values) do node.values[i] = walkExpr(v) end end
-  elseif k == "Assignment" then
-    for i, v in ipairs(node.values) do node.values[i] = walkExpr(v) end
-    -- targets: HUWAG i-VM (kailangang assignable pa rin)
-  elseif k == "LocalFunction" then walkBlock(node.func.body)
-  elseif k == "FunctionDeclaration" then walkBlock(node.func.body)
+  if k == "LocalFunction" then
+    local vm = tryVMFunctionBody(node.func.body)
+    if vm then node.func.body = vm else walkBlock(node.func.body) end
+  elseif k == "FunctionDeclaration" then
+    local vm = tryVMFunctionBody(node.func.body)
+    if vm then node.func.body = vm else walkBlock(node.func.body) end
   elseif k == "If" then
-    for _, cl in ipairs(node.clauses) do
-      cl.cond = walkExpr(cl.cond); walkBlock(cl.body)
-    end
+    for _, cl in ipairs(node.clauses) do walkBlock(cl.body) end
     if node.elseBody then walkBlock(node.elseBody) end
-  elseif k == "While" then node.cond = walkExpr(node.cond); walkBlock(node.body)
-  elseif k == "Repeat" then walkBlock(node.body); node.cond = walkExpr(node.cond)
+  elseif k == "While" then walkBlock(node.body)
+  elseif k == "Repeat" then walkBlock(node.body)
   elseif k == "Do" then walkBlock(node.body)
-  elseif k == "NumericFor" then
-    node.startExpr = walkExpr(node.startExpr)
-    node.stopExpr = walkExpr(node.stopExpr)
-    if node.stepExpr then node.stepExpr = walkExpr(node.stepExpr) end
-    walkBlock(node.body)
-  elseif k == "GenericFor" then
-    for i, it in ipairs(node.iters) do node.iters[i] = walkExpr(it) end
-    walkBlock(node.body)
-  elseif k == "Return" then
-    for i, v in ipairs(node.values) do node.values[i] = walkExpr(v) end
-  elseif k == "CallStatement" then
-    -- ang call statement mismo ay pwedeng may side-effect; i-VM lang kung
-    -- ligtas â€” pero dahil nagbabalik ng value ang __vm, at ok lang itapon,
-    -- i-VM natin ang loob (args) sa halip na ang buong call, para 'di masira
-    -- ang mga MethodCall/multi-return semantics.
-    node.call = walkExpr(node.call)
+  elseif k == "NumericFor" then walkBlock(node.body)
+  elseif k == "GenericFor" then walkBlock(node.body)
   end
 end
 
@@ -237,52 +288,51 @@ walkBlock = function(statements)
   for _, stmt in ipairs(statements) do walkStatement(stmt) end
 end
 
--- ===== Interpreter prelude (naka-inject sa itaas ng output) =====
+-- ===== Interpreter prelude =====
 
 function VM.prelude()
-  local lines = {
-    "local function __vm(code, K)",
-    "  local st = {}",
-    "  local sp = 0",
+  local L = {
+    "local function __vmrun(code, K)",
+    "  local R = {}",
     "  local i = 1",
     "  local n = #code",
     "  while i <= n do",
     "    local op = code[i]; i = i + 1",
-    "    if op == 1 then sp = sp + 1; st[sp] = K[code[i]]; i = i + 1",
-    "    elseif op == 2 then local name = K[code[i]]; i = i + 1; sp = sp + 1; st[sp] = _ENV[name]",
-    "    elseif op == 3 then st[sp-1] = st[sp-1] + st[sp]; sp = sp - 1",
-    "    elseif op == 4 then st[sp-1] = st[sp-1] - st[sp]; sp = sp - 1",
-    "    elseif op == 5 then st[sp-1] = st[sp-1] * st[sp]; sp = sp - 1",
-    "    elseif op == 6 then st[sp-1] = st[sp-1] / st[sp]; sp = sp - 1",
-    "    elseif op == 7 then st[sp-1] = st[sp-1] % st[sp]; sp = sp - 1",
-    "    elseif op == 8 then st[sp-1] = st[sp-1] ^ st[sp]; sp = sp - 1",
-    "    elseif op == 9 then st[sp-1] = st[sp-1] .. st[sp]; sp = sp - 1",
-    "    elseif op == 10 then st[sp-1] = st[sp-1] == st[sp]; sp = sp - 1",
-    "    elseif op == 11 then st[sp-1] = st[sp-1] ~= st[sp]; sp = sp - 1",
-    "    elseif op == 12 then st[sp-1] = st[sp-1] < st[sp]; sp = sp - 1",
-    "    elseif op == 13 then st[sp-1] = st[sp-1] > st[sp]; sp = sp - 1",
-    "    elseif op == 14 then st[sp-1] = st[sp-1] <= st[sp]; sp = sp - 1",
-    "    elseif op == 15 then st[sp-1] = st[sp-1] >= st[sp]; sp = sp - 1",
-    "    elseif op == 16 then st[sp-1] = st[sp-1] and st[sp]; sp = sp - 1",
-    "    elseif op == 17 then st[sp-1] = st[sp-1] or st[sp]; sp = sp - 1",
-    "    elseif op == 18 then st[sp] = -st[sp]",
-    "    elseif op == 19 then st[sp] = not st[sp]",
-    "    elseif op == 20 then st[sp] = #st[sp]",
-    "    elseif op == 21 then",
-    "      local argc = code[i]; i = i + 1",
+    "    if op == 1 then R[code[i]] = K[code[i+1]]; i = i + 2",              -- LOADK
+    "    elseif op == 2 then R[code[i]] = R[code[i+1]]; i = i + 2",         -- MOVE
+    "    elseif op == 3 then R[code[i]] = _ENV[K[code[i+1]]]; i = i + 2",   -- GETGLOBAL
+    "    elseif op == 4 then R[code[i]] = R[code[i+1]] + R[code[i+2]]; i = i + 3",   -- ADD
+    "    elseif op == 5 then R[code[i]] = R[code[i+1]] - R[code[i+2]]; i = i + 3",   -- SUB
+    "    elseif op == 6 then R[code[i]] = R[code[i+1]] * R[code[i+2]]; i = i + 3",   -- MUL
+    "    elseif op == 7 then R[code[i]] = R[code[i+1]] / R[code[i+2]]; i = i + 3",   -- DIV
+    "    elseif op == 8 then R[code[i]] = R[code[i+1]] % R[code[i+2]]; i = i + 3",   -- MOD
+    "    elseif op == 9 then R[code[i]] = R[code[i+1]] ^ R[code[i+2]]; i = i + 3",   -- POW
+    "    elseif op == 10 then R[code[i]] = R[code[i+1]] .. R[code[i+2]]; i = i + 3", -- CONCAT
+    "    elseif op == 11 then R[code[i]] = R[code[i+1]] == R[code[i+2]]; i = i + 3", -- EQ
+    "    elseif op == 12 then R[code[i]] = R[code[i+1]] ~= R[code[i+2]]; i = i + 3", -- NE
+    "    elseif op == 13 then R[code[i]] = R[code[i+1]] < R[code[i+2]]; i = i + 3",  -- LT
+    "    elseif op == 14 then R[code[i]] = R[code[i+1]] > R[code[i+2]]; i = i + 3",  -- GT
+    "    elseif op == 15 then R[code[i]] = R[code[i+1]] <= R[code[i+2]]; i = i + 3", -- LE
+    "    elseif op == 16 then R[code[i]] = R[code[i+1]] >= R[code[i+2]]; i = i + 3", -- GE
+    "    elseif op == 17 then R[code[i]] = -R[code[i+1]]; i = i + 2",       -- NEG
+    "    elseif op == 18 then R[code[i]] = not R[code[i+1]]; i = i + 2",    -- NOT
+    "    elseif op == 19 then R[code[i]] = #R[code[i+1]]; i = i + 2",       -- LEN
+    "    elseif op == 20 then",                                            -- CALL
+    "      local base = code[i]; local argc = code[i+1]; i = i + 2",
+    "      local fn = R[base]",
     "      local args = {}",
-    "      for a = argc, 1, -1 do args[a] = st[sp]; sp = sp - 1 end",
-    "      local fn = st[sp]; sp = sp - 1",
-    "      sp = sp + 1; st[sp] = fn(table.unpack(args))",
-    "    elseif op == 22 then sp = sp + 1; st[sp] = true",
-    "    elseif op == 23 then sp = sp + 1; st[sp] = false",
-    "    elseif op == 24 then sp = sp + 1; st[sp] = nil",
+    "      for a = 1, argc do args[a] = R[base + a] end",
+    "      R[base] = fn(table.unpack(args))",
+    "    elseif op == 21 then return R[code[i]]",                          -- RETURN
+    "    elseif op == 22 then i = code[i]",                                -- JMP
+    "    elseif op == 23 then",                                           -- JMPIFNOT
+    "      local reg = code[i]; local target = code[i+1]; i = i + 2",
+    "      if not R[reg] then i = target end",
     "    end",
     "  end",
-    "  return st[sp]",
-    "end"
+    "end",
   }
-  return table.concat(lines, "\n") .. "\n"
+  return table.concat(L, "\n") .. "\n"
 end
 
 function VM.transform(ast)
