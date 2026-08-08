@@ -2,7 +2,11 @@
 local Lexer = require("lexer")
 local Parser = require("parser")
 local Renamer = require("renamer")
+local NumEnc = require("numenc")
+local StringEnc = require("stringenc")
 local Generator = require("generator")
+
+math.randomseed(os.time())
 
 local code = [[
 local function add(a, b)
@@ -21,18 +25,23 @@ else
 end
 ]]
 
--- Buong pipeline: source -> tokens -> tree -> RENAME -> source
+-- BUONG PIPELINE
 local tokens = Lexer.tokenize(code)
 local ast = Parser.parse(tokens)
-ast = Renamer.rename(ast)           -- <-- ANG OBFUSCATION
-local output = Generator.generate(ast)
+
+ast = Renamer.rename(ast)          -- 1. variable renaming
+ast = NumEnc.obfuscate(ast)        -- 2. number obfuscation
+ast = StringEnc.encrypt(ast)       -- 3. string encryption
+
+-- 4. minify (true = compact)
+local body = Generator.generate(ast, true)
+local output = StringEnc.prelude() .. body
 
 print("===== ORIHINAL =====")
 print(code)
 print("===== OBFUSCATED =====")
 print(output)
 
--- Test: tumatakbo pa ba nang tama?
 print("===== PATAKBUHIN ANG OBFUSCATED =====")
 local fn = load(output)
 if fn then
