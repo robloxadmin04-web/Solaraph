@@ -1,7 +1,0 @@
-services:
-  - type: web
-    runtime: node
-    name: soluraph
-    rootDir: lua-obfuscator
-    buildCommand: npm install
-    startCommand: npm start
