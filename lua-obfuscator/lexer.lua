@@ -1,9 +1,9 @@
 -- lexer.lua
--- Ang unang lexer: source string -> listahan ng tokens
+-- Lexer: source string -> listahan ng tokens
 
 local Lexer = {}
 
--- Lahat ng reserved keywords sa Lua 5.1
+-- Lahat ng reserved keywords sa Lua
 local KEYWORDS = {
   ["and"]=true, ["break"]=true, ["do"]=true, ["else"]=true, ["elseif"]=true,
   ["end"]=true, ["false"]=true, ["for"]=true, ["function"]=true, ["goto"]=true,
@@ -12,38 +12,53 @@ local KEYWORDS = {
   ["until"]=true, ["while"]=true,
 }
 
--- Helper: totoo kung ang character ay letra o underscore
-local function isAlpha(c)
-  return c:match("[%a_]") ~= nil
-end
-
--- Helper: totoo kung ang character ay numero
-local function isDigit(c)
-  return c:match("%d") ~= nil
-end
-
--- Helper: letra, numero, o underscore (pang-loob ng identifier)
-local function isAlphaNum(c)
-  return c:match("[%w_]") ~= nil
-end
+local function isAlpha(c)    return c:match("[%a_]") ~= nil end
+local function isDigit(c)    return c:match("%d") ~= nil end
+local function isAlphaNum(c) return c:match("[%w_]") ~= nil end
 
 function Lexer.tokenize(source)
-  local tokens = {}   -- dito ilalagay ang lahat ng token
-  local i = 1         -- kasalukuyang posisyon sa string
-  local line = 1      -- linya, para sa error messages balang araw
+  local tokens = {}
+  local i = 1
+  local line = 1
   local len = #source
 
   while i <= len do
     local c = source:sub(i, i)
+    local nextC = source:sub(i + 1, i + 1)  -- ang kasunod na character (para sa dalawahang simbolo)
 
-    -- 1. Laktawan ang whitespace
+    -- 1. Newline: bilangin ang linya
     if c == "\n" then
       line = line + 1
       i = i + 1
+
+    -- 2. Iba pang whitespace: laktawan lang
     elseif c:match("%s") then
       i = i + 1
 
-    -- 2. Identifier o keyword (nagsisimula sa letra/underscore)
+    -- 3. COMMENT: nagsisimula sa "--"
+    elseif c == "-" and nextC == "-" then
+      i = i + 2  -- laktawan ang "--"
+      -- basahin hanggang katapusan ng linya, tapos itapon (hindi ginagawang token)
+      while i <= len and source:sub(i, i) ~= "\n" do
+        i = i + 1
+      end
+
+    -- 4. STRING: nagsisimula sa " o '
+    elseif c == '"' or c == "'" then
+      local quote = c          -- tandaan kung " o ' ang ginamit
+      local start = i
+      i = i + 1                -- laktawan ang pambukas na quote
+      while i <= len and source:sub(i, i) ~= quote do
+        -- kung may escape (\), laktawan ang susunod na character (hal. \" )
+        if source:sub(i, i) == "\\" then
+          i = i + 1
+        end
+        i = i + 1
+      end
+      i = i + 1                -- laktawan ang pansarang quote
+      table.insert(tokens, { type = "STRING", value = source:sub(start, i - 1), line = line })
+
+    -- 5. Identifier o keyword
     elseif isAlpha(c) then
       local start = i
       while i <= len and isAlphaNum(source:sub(i, i)) do
@@ -53,7 +68,7 @@ function Lexer.tokenize(source)
       local kind = KEYWORDS[word] and "KEYWORD" or "IDENTIFIER"
       table.insert(tokens, { type = kind, value = word, line = line })
 
-    -- 3. Numero (simpleng integer/decimal muna)
+    -- 6. Numero
     elseif isDigit(c) then
       local start = i
       while i <= len and (isDigit(source:sub(i, i)) or source:sub(i, i) == ".") do
@@ -61,14 +76,13 @@ function Lexer.tokenize(source)
       end
       table.insert(tokens, { type = "NUMBER", value = source:sub(start, i - 1), line = line })
 
-    -- 4. Operators at symbols (isahang character muna)
+    -- 7. Operator o simbolo (isahan muna)
     else
       table.insert(tokens, { type = "OPERATOR", value = c, line = line })
       i = i + 1
     end
   end
 
-  -- Pandulong marker na wala nang natira
   table.insert(tokens, { type = "EOF", value = "<eof>", line = line })
   return tokens
 end

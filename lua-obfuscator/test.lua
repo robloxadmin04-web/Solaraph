@@ -2,7 +2,9 @@
 local Lexer = require("lexer")
 
 local code = [[
-local x = 1 + 2
+local x = 1 + 2   -- ito ay comment, dapat mawala
+local name = "Solaraph"
+local msg = 'hello world'
 print(x)
 ]]
 
