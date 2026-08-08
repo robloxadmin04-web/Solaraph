@@ -1,5 +1,6 @@
 -- parser.lua
--- Parser: tokens -> AST. Luau-aware: continue, generalized for, compound assignment.
+-- Parser: tokens -> AST. Luau-aware: continue, generalized for, compound assignment,
+-- type annotations (local, for, AT function params/return).
 
 local Parser = {}
 Parser.__index = Parser
@@ -190,12 +191,16 @@ function Parser:parseParams()
   if not self:check("OPERATOR", ")") then
     repeat
       if self:check("OPERATOR", "...") then
-        self:advance(); table.insert(params, "..."); break
+        self:advance(); table.insert(params, "...")
+        self:skipTypeAnnotation()   -- Luau: typed vararg  ...: T
+        break
       end
       table.insert(params, self:expect("IDENTIFIER").value)
+      self:skipTypeAnnotation()     -- Luau: typed param  param: T
     until not self:accept("OPERATOR", ",")
   end
   self:expect("OPERATOR", ")")
+  self:skipTypeAnnotation()         -- Luau: return type  ): T
   return params
 end
 
