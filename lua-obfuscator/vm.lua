@@ -367,13 +367,19 @@ local function encryptCode(code, key)
   for i = 1, #code do out[i] = (code[i] ~ key) end
   return out
 end
+local function checksum(code)
+  local h = 5381
+  for i = 1, #code do h = (h * 33 + code[i]) % 2147483647 end
+  return h
+end
 compileFunction = function(parent, params, body)
   local c = newCompiler(parent)
   for _, p in ipairs(params) do if p == "..." then fail() end; c:declare(p) end
   c:compileBlock(body)
   c:emit(23)
   local key = nextKey()
-  return addProto({ code = encryptCode(c.code, key), K = c.K, upvals = c.upvals, boxed = c.boxed, key = key })
+  local enc = encryptCode(c.code, key)
+  return addProto({ code = enc, K = c.K, upvals = c.upvals, boxed = c.boxed, key = key, sum = checksum(enc) })
 end
 
 -- ===== Serialize proto tree -> Lua data literal =====
@@ -405,7 +411,7 @@ local function serializeProtos()
   for _, p in ipairs(protos) do
     table.insert(parts, "{c={" .. table.concat(p.code, ",") .. "},k=" .. serializeK(p.K)
       .. ",u=" .. serializeUpvals(p.upvals) .. ",b=" .. serializeBoxed(p.boxed)
-      .. ",key=" .. p.key .. "}")
+      .. ",key=" .. p.key .. ",sum=" .. p.sum .. "}")
   end
   return "{" .. table.concat(parts, ",") .. "}"
 end
@@ -417,7 +423,8 @@ function VM.transform(ast)
     mainC:compileBlock(ast.body)
     mainC:emit(23)
     local mkey = nextKey()
-    return addProto({ code = encryptCode(mainC.code, mkey), K = mainC.K, upvals = mainC.upvals, boxed = mainC.boxed, key = mkey })
+    local menc = encryptCode(mainC.code, mkey)
+    return addProto({ code = menc, K = mainC.K, upvals = mainC.upvals, boxed = mainC.boxed, key = mkey, sum = checksum(menc) })
   end)
   if not ok then VM._payload = nil; return ast end
   local opmapParts = {}
@@ -442,6 +449,9 @@ function VM.prelude()
     "  local K = proto.k",
     "  local boxed = proto.b",
     "  local __key = proto.key",
+    "  local __sum = 5381",
+    "  for __z = 1, #code do __sum = (__sum * 33 + code[__z]) % 2147483647 end",
+    "  if __sum ~= proto.sum then error('integrity check failed') end",
     "  local function d(x) return code[x] ~ __key end",
     "  local R = {}",
     "  local cells = {}",
