@@ -28,7 +28,25 @@ local function fail() error(UNSUPPORTED, 0) end
 
 local protos
 local __keysrc
-local function resetProtos() protos = {}; __keysrc = os.time() % 2147483647 end
+local OPMAP    -- logical opcode (1..34) -> physical number (random per build)
+local function buildOpMap(seed)
+  local n = 34
+  local phys = {}
+  for i = 1, n do phys[i] = i end
+  local s = seed % 2147483648
+  local function rnd() s = (s * 1103515245 + 12345) % 2147483648; return s end
+  for i = n, 2, -1 do
+    local j = (rnd() % i) + 1
+    phys[i], phys[j] = phys[j], phys[i]
+  end
+  OPMAP = {}
+  for logical = 1, n do OPMAP[logical] = phys[logical] end
+end
+local function resetProtos()
+  protos = {}
+  __keysrc = os.time() % 2147483647
+  buildOpMap(os.time() * 2654435761 % 2147483648)
+end
 local function nextKey()
   __keysrc = (__keysrc * 1103515245 + 12345) % 2147483648
   return (__keysrc // 256) % 65536
@@ -86,8 +104,8 @@ function Compiler:resolveUpval(name)
 end
 function Compiler:emit(...) local t = {...}; for _, x in ipairs(t) do table.insert(self.code, x) end end
 function Compiler:here() return #self.code end
-function Compiler:emitJmp() self:emit(24, 0); return #self.code end
-function Compiler:emitJmpIfNot(reg) self:emit(25, reg, 0); return #self.code end
+function Compiler:emitJmp() self:emit(OPMAP[24], 0); return #self.code end
+function Compiler:emitJmpIfNot(reg) self:emit(OPMAP[25], reg, 0); return #self.code end
 function Compiler:patch(idx) self.code[idx] = self:here() + 1 end
 function Compiler:patchTo(idx, target) self.code[idx] = target end
 function Compiler:refVar(name)
@@ -114,28 +132,28 @@ function Compiler:ceInto(node, dest)
 
   if k == "Number" then
     local n = tonumber(node.value); if n == nil then fail() end
-    self:emit(1, dest, self:addK(n))
+    self:emit(OPMAP[1], dest, self:addK(n))
 
   elseif k == "String" then
     local raw = node.value; local first = raw:sub(1,1)
     if first ~= '"' and first ~= "'" then fail() end
     local inner = raw:sub(2, #raw-1)
     if inner:find("\\", 1, true) then fail() end
-    self:emit(1, dest, self:addK(inner))
+    self:emit(OPMAP[1], dest, self:addK(inner))
 
   elseif k == "Literal" then
-    if node.value == "true" then self:emit(1, dest, self:addK(true))
-    elseif node.value == "false" then self:emit(1, dest, self:addK(false))
+    if node.value == "true" then self:emit(OPMAP[1], dest, self:addK(true))
+    elseif node.value == "false" then self:emit(OPMAP[1], dest, self:addK(false))
     else fail() end
 
   elseif k == "Variable" then
     local kind, x = self:refVar(node.name)
-    if kind == "local" then self:emit(2, dest, x)
-    elseif kind == "upval" then self:emit(27, dest, x)
-    else self:emit(3, dest, self:addK(node.name)) end
+    if kind == "local" then self:emit(OPMAP[2], dest, x)
+    elseif kind == "upval" then self:emit(OPMAP[27], dest, x)
+    else self:emit(OPMAP[3], dest, self:addK(node.name)) end
 
   elseif k == "BinaryOp" then
-    local opc = BINOP[node.op]; if not opc then fail() end
+    local opc = BINOP[node.op]; if not opc then fail() end; opc = OPMAP[opc]
     local saved = self.free
     local a = self:ceTop(node.left)
     local b = self:ceTop(node.right)
@@ -145,9 +163,9 @@ function Compiler:ceInto(node, dest)
   elseif k == "UnaryOp" then
     local saved = self.free
     local a = self:ceTop(node.operand)
-    if node.op == "-" then self:emit(18, dest, a)
-    elseif node.op == "not" then self:emit(19, dest, a)
-    elseif node.op == "#" then self:emit(20, dest, a)
+    if node.op == "-" then self:emit(OPMAP[18], dest, a)
+    elseif node.op == "not" then self:emit(OPMAP[19], dest, a)
+    elseif node.op == "#" then self:emit(OPMAP[20], dest, a)
     else fail() end
     self.free = saved; if self.free < dest + 1 then self.free = dest + 1 end
 
@@ -155,17 +173,17 @@ function Compiler:ceInto(node, dest)
     local saved = self.free
     local base = self:ceTop(node.callee)
     for _, arg in ipairs(node.args) do self:ceTop(arg) end
-    self:emit(21, base, #node.args)
+    self:emit(OPMAP[21], base, #node.args)
     self.free = saved
-    if base ~= dest then self:emit(2, dest, base) end
+    if base ~= dest then self:emit(OPMAP[2], dest, base) end
     if self.free < dest + 1 then self.free = dest + 1 end
 
   elseif k == "Function" then
     local pi = compileFunction(self, node.params, node.body)
-    self:emit(26, dest, pi)
+    self:emit(OPMAP[26], dest, pi)
 
   elseif k == "Table" then
-    self:emit(29, dest)
+    self:emit(OPMAP[29], dest)
     local arrayIdx = 1
     for _, f in ipairs(node.fields) do
       local saved = self.free
@@ -180,7 +198,7 @@ function Compiler:ceInto(node, dest)
         keyReg = self:ceTop(f.key)
         valReg = self:ceTop(f.value)
       end
-      self:emit(31, dest, keyReg, valReg)
+      self:emit(OPMAP[31], dest, keyReg, valReg)
       self.free = saved
     end
     if self.free < dest + 1 then self.free = dest + 1 end
@@ -191,7 +209,7 @@ function Compiler:ceInto(node, dest)
     local keyReg
     if node.field ~= nil then keyReg = self:ceTop({ kind = "String", value = string.format("%q", node.field) })
     else keyReg = self:ceTop(node.index) end
-    self:emit(30, dest, obj, keyReg)
+    self:emit(OPMAP[30], dest, obj, keyReg)
     self.free = saved; if self.free < dest + 1 then self.free = dest + 1 end
 
   elseif k == "MethodCall" then
@@ -199,11 +217,11 @@ function Compiler:ceInto(node, dest)
     local objReg = self:ceTop(node.object)
     local base = self:reserve(1)
     self:reserve(1)
-    self:emit(32, base, objReg, self:addK(node.method))
+    self:emit(OPMAP[32], base, objReg, self:addK(node.method))
     for _, arg in ipairs(node.args) do self:ceTop(arg) end
-    self:emit(21, base, #node.args + 1)
+    self:emit(OPMAP[21], base, #node.args + 1)
     self.free = saved
-    if base ~= dest then self:emit(2, dest, base) end
+    if base ~= dest then self:emit(OPMAP[2], dest, base) end
     if self.free < dest + 1 then self.free = dest + 1 end
 
   else
@@ -219,13 +237,13 @@ function Compiler:compileStmt(node)
     if node.values then for _, v in ipairs(node.values) do table.insert(vs, self:ceTop(v)) end end
     local regs = {}
     for _, name in ipairs(node.names) do table.insert(regs, self:declare(name)) end
-    for i = 1, #node.names do if vs[i] ~= nil then self:emit(2, regs[i], vs[i]) end end
+    for i = 1, #node.names do if vs[i] ~= nil then self:emit(OPMAP[2], regs[i], vs[i]) end end
     self.free = self.nlocals
 
   elseif k == "LocalFunction" then
     local r = self:declare(node.name)
     local pi = compileFunction(self, node.func.params, node.func.body)
-    self:emit(26, r, pi)
+    self:emit(OPMAP[26], r, pi)
     self.free = self.nlocals
 
   elseif k == "Assignment" then
@@ -236,16 +254,16 @@ function Compiler:compileStmt(node)
     for i, t in ipairs(node.targets) do
       if t.kind == "Variable" then
         local kind, x = self:refVar(t.name)
-        if kind == "local" then self:emit(2, x, vs[i])
-        elseif kind == "upval" then self:emit(28, vs[i], x)
-        else self:emit(4, vs[i], self:addK(t.name)) end
+        if kind == "local" then self:emit(OPMAP[2], x, vs[i])
+        elseif kind == "upval" then self:emit(OPMAP[28], vs[i], x)
+        else self:emit(OPMAP[4], vs[i], self:addK(t.name)) end
       elseif t.kind == "Index" then
         local s2 = self.free
         local obj = self:ceTop(t.object)
         local keyReg
         if t.field ~= nil then keyReg = self:ceTop({ kind = "String", value = string.format("%q", t.field) })
         else keyReg = self:ceTop(t.index) end
-        self:emit(31, obj, keyReg, vs[i])
+        self:emit(OPMAP[31], obj, keyReg, vs[i])
         self.free = s2
       else fail() end
     end
@@ -255,9 +273,9 @@ function Compiler:compileStmt(node)
     local saved = self.free; self:ceTop(node.call); self.free = saved
 
   elseif k == "Return" then
-    if #node.values == 0 then self:emit(23)
+    if #node.values == 0 then self:emit(OPMAP[23])
     elseif #node.values == 1 then
-      local saved = self.free; local r = self:ceTop(node.values[1]); self:emit(22, r); self.free = saved
+      local saved = self.free; local r = self:ceTop(node.values[1]); self:emit(OPMAP[22], r); self.free = saved
     else fail() end
 
   elseif k == "If" then
@@ -288,22 +306,22 @@ function Compiler:compileStmt(node)
     self:pushScope()
     local v = self:declare(node.var)
     local saved = self.free
-    local st = self:ceTop(node.startExpr); self:emit(2, v, st); self.free = saved
+    local st = self:ceTop(node.startExpr); self:emit(OPMAP[2], v, st); self.free = saved
     local stopReg = self:declare("(stop)")
-    local s1 = self:ceTop(node.stopExpr); self:emit(2, stopReg, s1); self.free = self.nlocals
+    local s1 = self:ceTop(node.stopExpr); self:emit(OPMAP[2], stopReg, s1); self.free = self.nlocals
     local stepReg = self:declare("(step)")
     if node.stepExpr then
-      local s2 = self:ceTop(node.stepExpr); self:emit(2, stepReg, s2); self.free = self.nlocals
+      local s2 = self:ceTop(node.stepExpr); self:emit(OPMAP[2], stepReg, s2); self.free = self.nlocals
     else
-      self:emit(1, stepReg, self:addK(1))
+      self:emit(OPMAP[1], stepReg, self:addK(1))
     end
     local top = self:here() + 1
     local saved2 = self.free
-    local cmp = self:reserve(1); self:emit(16, cmp, v, stopReg)
+    local cmp = self:reserve(1); self:emit(OPMAP[16], cmp, v, stopReg)
     local exit = self:emitJmpIfNot(cmp)
     self.free = saved2
     self:compileBlock(node.body)
-    self:emit(5, v, v, stepReg)
+    self:emit(OPMAP[5], v, v, stepReg)
     self:patchTo(self:emitJmp(), top)
     self:patch(exit)
     self:popScope()
@@ -317,16 +335,16 @@ function Compiler:compileStmt(node)
     local sf = self.free
     local iterRegs = {}
     for _, e in ipairs(node.iters) do table.insert(iterRegs, self:ceTop(e)) end
-    self:emit(2, fReg, iterRegs[1])
+    self:emit(OPMAP[2], fReg, iterRegs[1])
     self.free = self.nlocals
     local varRegs = {}
     for _, nm in ipairs(node.names) do table.insert(varRegs, self:declare(nm)) end
     local top = self:here() + 1
     local sf2 = self.free
     local callBase = self:reserve(1)
-    self:emit(2, callBase, fReg)
-    self:emit(33, callBase, 0, #node.names)
-    for idx, nm in ipairs(node.names) do self:emit(2, varRegs[idx], callBase + idx - 1) end
+    self:emit(OPMAP[2], callBase, fReg)
+    self:emit(OPMAP[33], callBase, 0, #node.names)
+    for idx, nm in ipairs(node.names) do self:emit(OPMAP[2], varRegs[idx], callBase + idx - 1) end
     self.free = sf2
     local exit = self:emitJmpIfNot(varRegs[1])
     self.free = self.nlocals
@@ -402,7 +420,9 @@ function VM.transform(ast)
     return addProto({ code = encryptCode(mainC.code, mkey), K = mainC.K, upvals = mainC.upvals, boxed = mainC.boxed, key = mkey })
   end)
   if not ok then VM._payload = nil; return ast end
-  VM._payload = { protoData = serializeProtos(), mainIndex = res }
+  local opmapParts = {}
+  for logical = 1, 34 do table.insert(opmapParts, OPMAP[logical]) end
+  VM._payload = { protoData = serializeProtos(), mainIndex = res, opmap = "{" .. table.concat(opmapParts, ",") .. "}" }
   ast.body = { { kind = "CallStatement", call = { kind = "Raw", text = "__vmmain()" } } }
   return ast
 end
@@ -412,6 +432,9 @@ end
 function VM.prelude()
   if not VM._payload then return "" end
   local L = {
+    "local __OPMAP = " .. VM._payload.opmap,
+    "local __DEC = {}",
+    "for __l = 1, #__OPMAP do __DEC[__OPMAP[__l]] = __l end",
     "local __protos = " .. VM._payload.protoData,
     "local __exec, __mkclosure",
     "__exec = function(proto, upvals, args)",
@@ -429,7 +452,7 @@ function VM.prelude()
     "  local i = 1",
     "  local n = #code",
     "  while i <= n do",
-    "    local op = d(i); i = i + 1",
+    "    local op = __DEC[d(i)]; i = i + 1",
     "    if op == 1 then sR(d(i), K[d(i+1)]); i = i + 2",
     "    elseif op == 2 then sR(d(i), gR(d(i+1))); i = i + 2",
     "    elseif op == 3 then sR(d(i), _ENV[K[d(i+1)]]); i = i + 2",
