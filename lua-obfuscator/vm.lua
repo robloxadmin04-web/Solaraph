@@ -159,6 +159,48 @@ function Compiler:ceInto(node, dest)
     local pi = compileFunction(self, node.params, node.body)
     self:emit(26, dest, pi)
 
+  elseif k == "Table" then
+    self:emit(29, dest)
+    local arrayIdx = 1
+    for _, f in ipairs(node.fields) do
+      local saved = self.free
+      local keyReg, valReg
+      if f.kind == "array" then
+        keyReg = self:ceTop({ kind = "Number", value = tostring(arrayIdx) }); arrayIdx = arrayIdx + 1
+        valReg = self:ceTop(f.value)
+      elseif f.kind == "named" then
+        keyReg = self:ceTop({ kind = "String", value = string.format("%q", f.name) })
+        valReg = self:ceTop(f.value)
+      else
+        keyReg = self:ceTop(f.key)
+        valReg = self:ceTop(f.value)
+      end
+      self:emit(31, dest, keyReg, valReg)
+      self.free = saved
+    end
+    if self.free < dest + 1 then self.free = dest + 1 end
+
+  elseif k == "Index" then
+    local saved = self.free
+    local obj = self:ceTop(node.object)
+    local keyReg
+    if node.field ~= nil then keyReg = self:ceTop({ kind = "String", value = string.format("%q", node.field) })
+    else keyReg = self:ceTop(node.index) end
+    self:emit(30, dest, obj, keyReg)
+    self.free = saved; if self.free < dest + 1 then self.free = dest + 1 end
+
+  elseif k == "MethodCall" then
+    local saved = self.free
+    local objReg = self:ceTop(node.object)
+    local base = self:reserve(1)
+    self:reserve(1)
+    self:emit(32, base, objReg, self:addK(node.method))
+    for _, arg in ipairs(node.args) do self:ceTop(arg) end
+    self:emit(21, base, #node.args + 1)
+    self.free = saved
+    if base ~= dest then self:emit(2, dest, base) end
+    if self.free < dest + 1 then self.free = dest + 1 end
+
   else
     fail()
   end
@@ -187,11 +229,20 @@ function Compiler:compileStmt(node)
     local vs = {}
     for _, v in ipairs(node.values) do table.insert(vs, self:ceTop(v)) end
     for i, t in ipairs(node.targets) do
-      if t.kind ~= "Variable" then fail() end
-      local kind, x = self:refVar(t.name)
-      if kind == "local" then self:emit(2, x, vs[i])
-      elseif kind == "upval" then self:emit(28, vs[i], x)
-      else self:emit(4, vs[i], self:addK(t.name)) end
+      if t.kind == "Variable" then
+        local kind, x = self:refVar(t.name)
+        if kind == "local" then self:emit(2, x, vs[i])
+        elseif kind == "upval" then self:emit(28, vs[i], x)
+        else self:emit(4, vs[i], self:addK(t.name)) end
+      elseif t.kind == "Index" then
+        local s2 = self.free
+        local obj = self:ceTop(t.object)
+        local keyReg
+        if t.field ~= nil then keyReg = self:ceTop({ kind = "String", value = string.format("%q", t.field) })
+        else keyReg = self:ceTop(t.index) end
+        self:emit(31, obj, keyReg, vs[i])
+        self.free = s2
+      else fail() end
     end
     self.free = saved
 
@@ -254,6 +305,30 @@ function Compiler:compileStmt(node)
 
   elseif k == "Do" then
     self:pushScope(); self:compileBlock(node.body); self:popScope()
+
+  elseif k == "GenericFor" then
+    self:pushScope()
+    local fReg = self:declare("(f)")
+    local sf = self.free
+    local iterRegs = {}
+    for _, e in ipairs(node.iters) do table.insert(iterRegs, self:ceTop(e)) end
+    self:emit(2, fReg, iterRegs[1])
+    self.free = self.nlocals
+    local varRegs = {}
+    for _, nm in ipairs(node.names) do table.insert(varRegs, self:declare(nm)) end
+    local top = self:here() + 1
+    local sf2 = self.free
+    local callBase = self:reserve(1)
+    self:emit(2, callBase, fReg)
+    self:emit(33, callBase, 0, #node.names)
+    for idx, nm in ipairs(node.names) do self:emit(2, varRegs[idx], callBase + idx - 1) end
+    self.free = sf2
+    local exit = self:emitJmpIfNot(varRegs[1])
+    self.free = self.nlocals
+    self:compileBlock(node.body)
+    self:patchTo(self:emitJmp(), top)
+    self:patch(exit)
+    self:popScope()
 
   else
     fail()
@@ -375,6 +450,18 @@ function VM.prelude()
     "    elseif op == 26 then sR(code[i], __mkclosure(__protos[code[i+1]], cells, upvals)); i = i + 2",
     "    elseif op == 27 then sR(code[i], upvals[code[i+1]].v); i = i + 2",
     "    elseif op == 28 then upvals[code[i+1]].v = gR(code[i]); i = i + 2",
+    "    elseif op == 29 then sR(code[i], {}); i = i + 1",
+    "    elseif op == 30 then sR(code[i], gR(code[i+1])[gR(code[i+2])]); i = i + 3",
+    "    elseif op == 31 then gR(code[i])[gR(code[i+1])] = gR(code[i+2]); i = i + 3",
+    "    elseif op == 32 then local __t = gR(code[i+1]); sR(code[i], __t[K[code[i+2]]]); sR(code[i]+1, __t); i = i + 3",
+    "    elseif op == 33 then",
+    "      local base = code[i]; local ns = code[i+2]; i = i + 3",
+    "      local f = gR(base)",
+    "      local r1, r2 = f()",
+    "      sR(base, r1); if ns >= 2 then sR(base + 1, r2) end",
+    "    elseif op == 34 then",
+    "      local reg = code[i]; local target = code[i+1]; i = i + 2",
+    "      if gR(reg) then i = target end",
     "    end",
     "  end",
     "end",
