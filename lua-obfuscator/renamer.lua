@@ -115,7 +115,10 @@ function Renamer:transformStatement(node)
     self:transformExpr(node.target)
     self:pushScope()
     for i, p in ipairs(node.func.params) do
-      if p ~= "..." then node.func.params[i] = self:declare(p) end
+      -- huwag i-rename ang implicit na "self" sa method (: syntax) — tinatanggal ito ng generator
+      if p ~= "..." and not (node.isMethod and i == 1) then
+        node.func.params[i] = self:declare(p)
+      end
     end
     self:transformBlock(node.func.body)
     self:popScope()
