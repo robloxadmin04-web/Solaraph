@@ -16,7 +16,7 @@
 --
 -- BAKIT "LIGTAS":
 --  * Hindi hinahati ang mga statement na may sariling control flow palabas
---    (Return, Break) — kapag may nakita nito sa isang sequence, ang buong
+--    (Return, Break) â€” kapag may nakita nito sa isang sequence, ang buong
 --    natitirang bahagi mula doon ay inilalagay sa iisang huling state, kaya
 --    hindi nasisira ang semantics ng return/break.
 --  * Recursive: pinapasok nito ang loob ng function/if/for/while/do para
@@ -24,7 +24,7 @@
 --  * Ang state variable ay may prefix na "_cf" para hindi sumalpok sa scope
 --    (tumatakbo ito pagkatapos ng renamer sa pipeline).
 --  * Kailangan ng >= MIN_RUN na magkakasunod na "flat" na statement bago
---    mag-flatten — kung wala, iniiwan buo (walang saysay i-flatten ang 1-2).
+--    mag-flatten â€” kung wala, iniiwan buo (walang saysay i-flatten ang 1-2).
 
 local CFlatten = {}
 
@@ -39,6 +39,21 @@ end
 -- Ang mga statement na "control-terminating": kapag nakita, huminto ang run.
 local function isTerminator(node)
   return node.kind == "Return" or node.kind == "Break"
+end
+
+-- Ang mga statement na gumagawa ng LOCAL scope. HINDI ligtas biyakin ang mga
+-- ito sa magkakahiwalay na state ng dispatcher: ang bawat clause ng if/elseif
+-- ay may sariling scope, kaya ang local na idineklara sa isang state ay HINDI
+-- na makikita ng ibang state (nagiging nil / global). Kaya ituturing itong
+-- "hindi maaaring i-flatten" â€” iniiwan buo sa labas ng dispatcher.
+local function makesLocal(node)
+  return node.kind == "LocalAssignment" or node.kind == "LocalFunction"
+end
+
+-- Maaari bang isama ang statement sa isang fla-flatten na run?
+-- HINDI kung terminator (return/break) o kung gumagawa ito ng local.
+local function isFlattenable(node)
+  return not isTerminator(node) and not makesLocal(node)
 end
 
 local flattenBlock
@@ -153,12 +168,13 @@ flattenBlock = function(statements)
   end
 
   for _, stmt in ipairs(statements) do
-    if isTerminator(stmt) then
-      -- huminto ang run BAGO ang terminator; ilagay ang terminator nang buo
+    if isFlattenable(stmt) then
+      -- ligtas na isama sa kasalukuyang run
+      table.insert(run, stmt)
+    else
+      -- terminator O local-declaration: isara ang run BAGO ito, ilagay itong buo
       flushRun()
       table.insert(out, stmt)
-    else
-      table.insert(run, stmt)
     end
   end
   flushRun()
