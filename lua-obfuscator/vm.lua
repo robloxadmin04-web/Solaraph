@@ -10,15 +10,15 @@
 --    x = __vm({...bytecode...}, {...constants...})
 --
 -- Ang __vm interpreter (prelude) ang nagpapatakbo ng bytecode gamit ang value
--- stack. Parehong resulta, pero nawala ang orihinal na anyo ng expression —
+-- stack. Parehong resulta, pero nawala ang orihinal na anyo ng expression â€”
 -- ito na ang pinaka-malakas na layer dahil kailangang unawain ng attacker ang
 -- buong VM bago mabasa kahit isang linya.
 --
 -- SAKLAW (LIGTAS/subset): kino-compile lang ang mga expression na PURONG
--- kaya ng stack machine — numbers, strings, booleans, variable reads,
+-- kaya ng stack machine â€” numbers, strings, booleans, variable reads,
 -- unary/binary ops, at function calls kung saan simple ang callee. Kapag may
 -- nakita itong hindi pa suportado (tables, method calls, varargs, function
--- literals, index/field access), IWINAN ang buong expression na buo — kaya
+-- literals, index/field access), IWINAN ang buong expression na buo â€” kaya
 -- garantisadong hindi nasisira ang code, lumiliit lang ang saklaw.
 --
 -- Tumatakbo dapat HULI-HULI sa pipeline (pagkatapos ng rename/numbers) dahil
@@ -227,7 +227,7 @@ walkStatement = function(node)
     for i, v in ipairs(node.values) do node.values[i] = walkExpr(v) end
   elseif k == "CallStatement" then
     -- ang call statement mismo ay pwedeng may side-effect; i-VM lang kung
-    -- ligtas — pero dahil nagbabalik ng value ang __vm, at ok lang itapon,
+    -- ligtas â€” pero dahil nagbabalik ng value ang __vm, at ok lang itapon,
     -- i-VM natin ang loob (args) sa halip na ang buong call, para 'di masira
     -- ang mga MethodCall/multi-return semantics.
     node.call = walkExpr(node.call)
@@ -241,48 +241,49 @@ end
 -- ===== Interpreter prelude (naka-inject sa itaas ng output) =====
 
 function VM.prelude()
-  return [[
-local function __vm(code, K)
-  local st = {}
-  local sp = 0
-  local i = 1
-  local n = #code
-  while i <= n do
-    local op = code[i]; i = i + 1
-    if op == 1 then sp = sp + 1; st[sp] = K[code[i]]; i = i + 1
-    elseif op == 2 then local name = K[code[i]]; i = i + 1; sp = sp + 1; st[sp] = _ENV[name]
-    elseif op == 3 then st[sp-1] = st[sp-1] + st[sp]; sp = sp - 1
-    elseif op == 4 then st[sp-1] = st[sp-1] - st[sp]; sp = sp - 1
-    elseif op == 5 then st[sp-1] = st[sp-1] * st[sp]; sp = sp - 1
-    elseif op == 6 then st[sp-1] = st[sp-1] / st[sp]; sp = sp - 1
-    elseif op == 7 then st[sp-1] = st[sp-1] % st[sp]; sp = sp - 1
-    elseif op == 8 then st[sp-1] = st[sp-1] ^ st[sp]; sp = sp - 1
-    elseif op == 9 then st[sp-1] = st[sp-1] .. st[sp]; sp = sp - 1
-    elseif op == 10 then st[sp-1] = st[sp-1] == st[sp]; sp = sp - 1
-    elseif op == 11 then st[sp-1] = st[sp-1] ~= st[sp]; sp = sp - 1
-    elseif op == 12 then st[sp-1] = st[sp-1] < st[sp]; sp = sp - 1
-    elseif op == 13 then st[sp-1] = st[sp-1] > st[sp]; sp = sp - 1
-    elseif op == 14 then st[sp-1] = st[sp-1] <= st[sp]; sp = sp - 1
-    elseif op == 15 then st[sp-1] = st[sp-1] >= st[sp]; sp = sp - 1
-    elseif op == 16 then st[sp-1] = st[sp-1] and st[sp]; sp = sp - 1
-    elseif op == 17 then st[sp-1] = st[sp-1] or st[sp]; sp = sp - 1
-    elseif op == 18 then st[sp] = -st[sp]
-    elseif op == 19 then st[sp] = not st[sp]
-    elseif op == 20 then st[sp] = #st[sp]
-    elseif op == 21 then
-      local argc = code[i]; i = i + 1
-      local args = {}
-      for a = argc, 1, -1 do args[a] = st[sp]; sp = sp - 1 end
-      local fn = st[sp]; sp = sp - 1
-      sp = sp + 1; st[sp] = fn(table.unpack(args))
-    elseif op == 22 then sp = sp + 1; st[sp] = true
-    elseif op == 23 then sp = sp + 1; st[sp] = false
-    elseif op == 24 then sp = sp + 1; st[sp] = nil
-    end
-  end
-  return st[sp]
-end
-]]
+  local lines = {
+    "local function __vm(code, K)",
+    "  local st = {}",
+    "  local sp = 0",
+    "  local i = 1",
+    "  local n = #code",
+    "  while i <= n do",
+    "    local op = code[i]; i = i + 1",
+    "    if op == 1 then sp = sp + 1; st[sp] = K[code[i]]; i = i + 1",
+    "    elseif op == 2 then local name = K[code[i]]; i = i + 1; sp = sp + 1; st[sp] = _ENV[name]",
+    "    elseif op == 3 then st[sp-1] = st[sp-1] + st[sp]; sp = sp - 1",
+    "    elseif op == 4 then st[sp-1] = st[sp-1] - st[sp]; sp = sp - 1",
+    "    elseif op == 5 then st[sp-1] = st[sp-1] * st[sp]; sp = sp - 1",
+    "    elseif op == 6 then st[sp-1] = st[sp-1] / st[sp]; sp = sp - 1",
+    "    elseif op == 7 then st[sp-1] = st[sp-1] % st[sp]; sp = sp - 1",
+    "    elseif op == 8 then st[sp-1] = st[sp-1] ^ st[sp]; sp = sp - 1",
+    "    elseif op == 9 then st[sp-1] = st[sp-1] .. st[sp]; sp = sp - 1",
+    "    elseif op == 10 then st[sp-1] = st[sp-1] == st[sp]; sp = sp - 1",
+    "    elseif op == 11 then st[sp-1] = st[sp-1] ~= st[sp]; sp = sp - 1",
+    "    elseif op == 12 then st[sp-1] = st[sp-1] < st[sp]; sp = sp - 1",
+    "    elseif op == 13 then st[sp-1] = st[sp-1] > st[sp]; sp = sp - 1",
+    "    elseif op == 14 then st[sp-1] = st[sp-1] <= st[sp]; sp = sp - 1",
+    "    elseif op == 15 then st[sp-1] = st[sp-1] >= st[sp]; sp = sp - 1",
+    "    elseif op == 16 then st[sp-1] = st[sp-1] and st[sp]; sp = sp - 1",
+    "    elseif op == 17 then st[sp-1] = st[sp-1] or st[sp]; sp = sp - 1",
+    "    elseif op == 18 then st[sp] = -st[sp]",
+    "    elseif op == 19 then st[sp] = not st[sp]",
+    "    elseif op == 20 then st[sp] = #st[sp]",
+    "    elseif op == 21 then",
+    "      local argc = code[i]; i = i + 1",
+    "      local args = {}",
+    "      for a = argc, 1, -1 do args[a] = st[sp]; sp = sp - 1 end",
+    "      local fn = st[sp]; sp = sp - 1",
+    "      sp = sp + 1; st[sp] = fn(table.unpack(args))",
+    "    elseif op == 22 then sp = sp + 1; st[sp] = true",
+    "    elseif op == 23 then sp = sp + 1; st[sp] = false",
+    "    elseif op == 24 then sp = sp + 1; st[sp] = nil",
+    "    end",
+    "  end",
+    "  return st[sp]",
+    "end"
+  }
+  return table.concat(lines, "\n") .. "\n"
 end
 
 function VM.transform(ast)
