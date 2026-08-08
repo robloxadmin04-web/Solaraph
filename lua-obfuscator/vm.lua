@@ -27,7 +27,12 @@ local UNSUPPORTED = "__vm_unsupported"
 local function fail() error(UNSUPPORTED, 0) end
 
 local protos
-local function resetProtos() protos = {} end
+local __keysrc
+local function resetProtos() protos = {}; __keysrc = os.time() % 2147483647 end
+local function nextKey()
+  __keysrc = (__keysrc * 1103515245 + 12345) % 2147483648
+  return (__keysrc // 256) % 65536
+end
 local function addProto(p) table.insert(protos, p); return #protos end
 
 -- ===== Compiler =====
@@ -339,12 +344,18 @@ function Compiler:compileBlock(statements)
   for _, stmt in ipairs(statements) do self:compileStmt(stmt); self.free = self.nlocals end
 end
 
+local function encryptCode(code, key)
+  local out = {}
+  for i = 1, #code do out[i] = (code[i] ~ key) end
+  return out
+end
 compileFunction = function(parent, params, body)
   local c = newCompiler(parent)
   for _, p in ipairs(params) do if p == "..." then fail() end; c:declare(p) end
   c:compileBlock(body)
   c:emit(23)
-  return addProto({ code = c.code, K = c.K, upvals = c.upvals, boxed = c.boxed })
+  local key = nextKey()
+  return addProto({ code = encryptCode(c.code, key), K = c.K, upvals = c.upvals, boxed = c.boxed, key = key })
 end
 
 -- ===== Serialize proto tree -> Lua data literal =====
@@ -375,7 +386,8 @@ local function serializeProtos()
   local parts = {}
   for _, p in ipairs(protos) do
     table.insert(parts, "{c={" .. table.concat(p.code, ",") .. "},k=" .. serializeK(p.K)
-      .. ",u=" .. serializeUpvals(p.upvals) .. ",b=" .. serializeBoxed(p.boxed) .. "}")
+      .. ",u=" .. serializeUpvals(p.upvals) .. ",b=" .. serializeBoxed(p.boxed)
+      .. ",key=" .. p.key .. "}")
   end
   return "{" .. table.concat(parts, ",") .. "}"
 end
@@ -386,7 +398,8 @@ function VM.transform(ast)
     local mainC = newCompiler(nil)
     mainC:compileBlock(ast.body)
     mainC:emit(23)
-    return addProto({ code = mainC.code, K = mainC.K, upvals = mainC.upvals, boxed = mainC.boxed })
+    local mkey = nextKey()
+    return addProto({ code = encryptCode(mainC.code, mkey), K = mainC.K, upvals = mainC.upvals, boxed = mainC.boxed, key = mkey })
   end)
   if not ok then VM._payload = nil; return ast end
   VM._payload = { protoData = serializeProtos(), mainIndex = res }
@@ -405,6 +418,8 @@ function VM.prelude()
     "  local code = proto.c",
     "  local K = proto.k",
     "  local boxed = proto.b",
+    "  local __key = proto.key",
+    "  local function d(x) return code[x] ~ __key end",
     "  local R = {}",
     "  local cells = {}",
     "  for r in pairs(boxed) do cells[r] = { v = nil } end",
@@ -414,53 +429,53 @@ function VM.prelude()
     "  local i = 1",
     "  local n = #code",
     "  while i <= n do",
-    "    local op = code[i]; i = i + 1",
-    "    if op == 1 then sR(code[i], K[code[i+1]]); i = i + 2",
-    "    elseif op == 2 then sR(code[i], gR(code[i+1])); i = i + 2",
-    "    elseif op == 3 then sR(code[i], _ENV[K[code[i+1]]]); i = i + 2",
-    "    elseif op == 4 then _ENV[K[code[i+1]]] = gR(code[i]); i = i + 2",
-    "    elseif op == 5 then sR(code[i], gR(code[i+1]) + gR(code[i+2])); i = i + 3",
-    "    elseif op == 6 then sR(code[i], gR(code[i+1]) - gR(code[i+2])); i = i + 3",
-    "    elseif op == 7 then sR(code[i], gR(code[i+1]) * gR(code[i+2])); i = i + 3",
-    "    elseif op == 8 then sR(code[i], gR(code[i+1]) / gR(code[i+2])); i = i + 3",
-    "    elseif op == 9 then sR(code[i], gR(code[i+1]) % gR(code[i+2])); i = i + 3",
-    "    elseif op == 10 then sR(code[i], gR(code[i+1]) ^ gR(code[i+2])); i = i + 3",
-    "    elseif op == 11 then sR(code[i], gR(code[i+1]) .. gR(code[i+2])); i = i + 3",
-    "    elseif op == 12 then sR(code[i], gR(code[i+1]) == gR(code[i+2])); i = i + 3",
-    "    elseif op == 13 then sR(code[i], gR(code[i+1]) ~= gR(code[i+2])); i = i + 3",
-    "    elseif op == 14 then sR(code[i], gR(code[i+1]) < gR(code[i+2])); i = i + 3",
-    "    elseif op == 15 then sR(code[i], gR(code[i+1]) > gR(code[i+2])); i = i + 3",
-    "    elseif op == 16 then sR(code[i], gR(code[i+1]) <= gR(code[i+2])); i = i + 3",
-    "    elseif op == 17 then sR(code[i], gR(code[i+1]) >= gR(code[i+2])); i = i + 3",
-    "    elseif op == 18 then sR(code[i], -gR(code[i+1])); i = i + 2",
-    "    elseif op == 19 then sR(code[i], not gR(code[i+1])); i = i + 2",
-    "    elseif op == 20 then sR(code[i], #gR(code[i+1])); i = i + 2",
+    "    local op = d(i); i = i + 1",
+    "    if op == 1 then sR(d(i), K[d(i+1)]); i = i + 2",
+    "    elseif op == 2 then sR(d(i), gR(d(i+1))); i = i + 2",
+    "    elseif op == 3 then sR(d(i), _ENV[K[d(i+1)]]); i = i + 2",
+    "    elseif op == 4 then _ENV[K[d(i+1)]] = gR(d(i)); i = i + 2",
+    "    elseif op == 5 then sR(d(i), gR(d(i+1)) + gR(d(i+2))); i = i + 3",
+    "    elseif op == 6 then sR(d(i), gR(d(i+1)) - gR(d(i+2))); i = i + 3",
+    "    elseif op == 7 then sR(d(i), gR(d(i+1)) * gR(d(i+2))); i = i + 3",
+    "    elseif op == 8 then sR(d(i), gR(d(i+1)) / gR(d(i+2))); i = i + 3",
+    "    elseif op == 9 then sR(d(i), gR(d(i+1)) % gR(d(i+2))); i = i + 3",
+    "    elseif op == 10 then sR(d(i), gR(d(i+1)) ^ gR(d(i+2))); i = i + 3",
+    "    elseif op == 11 then sR(d(i), gR(d(i+1)) .. gR(d(i+2))); i = i + 3",
+    "    elseif op == 12 then sR(d(i), gR(d(i+1)) == gR(d(i+2))); i = i + 3",
+    "    elseif op == 13 then sR(d(i), gR(d(i+1)) ~= gR(d(i+2))); i = i + 3",
+    "    elseif op == 14 then sR(d(i), gR(d(i+1)) < gR(d(i+2))); i = i + 3",
+    "    elseif op == 15 then sR(d(i), gR(d(i+1)) > gR(d(i+2))); i = i + 3",
+    "    elseif op == 16 then sR(d(i), gR(d(i+1)) <= gR(d(i+2))); i = i + 3",
+    "    elseif op == 17 then sR(d(i), gR(d(i+1)) >= gR(d(i+2))); i = i + 3",
+    "    elseif op == 18 then sR(d(i), -gR(d(i+1))); i = i + 2",
+    "    elseif op == 19 then sR(d(i), not gR(d(i+1))); i = i + 2",
+    "    elseif op == 20 then sR(d(i), #gR(d(i+1))); i = i + 2",
     "    elseif op == 21 then",
-    "      local base = code[i]; local argc = code[i+1]; i = i + 2",
+    "      local base = d(i); local argc = d(i+1); i = i + 2",
     "      local fn = gR(base)",
     "      local a = {}",
     "      for j = 1, argc do a[j] = gR(base + j) end",
     "      sR(base, fn(table.unpack(a, 1, argc)))",
-    "    elseif op == 22 then return gR(code[i])",
+    "    elseif op == 22 then return gR(d(i))",
     "    elseif op == 23 then return",
-    "    elseif op == 24 then i = code[i]",
+    "    elseif op == 24 then i = d(i)",
     "    elseif op == 25 then",
-    "      local reg = code[i]; local target = code[i+1]; i = i + 2",
+    "      local reg = d(i); local target = d(i+1); i = i + 2",
     "      if not gR(reg) then i = target end",
-    "    elseif op == 26 then sR(code[i], __mkclosure(__protos[code[i+1]], cells, upvals)); i = i + 2",
-    "    elseif op == 27 then sR(code[i], upvals[code[i+1]].v); i = i + 2",
-    "    elseif op == 28 then upvals[code[i+1]].v = gR(code[i]); i = i + 2",
-    "    elseif op == 29 then sR(code[i], {}); i = i + 1",
-    "    elseif op == 30 then sR(code[i], gR(code[i+1])[gR(code[i+2])]); i = i + 3",
-    "    elseif op == 31 then gR(code[i])[gR(code[i+1])] = gR(code[i+2]); i = i + 3",
-    "    elseif op == 32 then local __t = gR(code[i+1]); sR(code[i], __t[K[code[i+2]]]); sR(code[i]+1, __t); i = i + 3",
+    "    elseif op == 26 then sR(d(i), __mkclosure(__protos[d(i+1)], cells, upvals)); i = i + 2",
+    "    elseif op == 27 then sR(d(i), upvals[d(i+1)].v); i = i + 2",
+    "    elseif op == 28 then upvals[d(i+1)].v = gR(d(i)); i = i + 2",
+    "    elseif op == 29 then sR(d(i), {}); i = i + 1",
+    "    elseif op == 30 then sR(d(i), gR(d(i+1))[gR(d(i+2))]); i = i + 3",
+    "    elseif op == 31 then gR(d(i))[gR(d(i+1))] = gR(d(i+2)); i = i + 3",
+    "    elseif op == 32 then local __t = gR(d(i+1)); sR(d(i), __t[K[d(i+2)]]); sR(d(i)+1, __t); i = i + 3",
     "    elseif op == 33 then",
-    "      local base = code[i]; local ns = code[i+2]; i = i + 3",
+    "      local base = d(i); local ns = d(i+2); i = i + 3",
     "      local f = gR(base)",
     "      local r1, r2 = f()",
     "      sR(base, r1); if ns >= 2 then sR(base + 1, r2) end",
     "    elseif op == 34 then",
-    "      local reg = code[i]; local target = code[i+1]; i = i + 2",
+    "      local reg = d(i); local target = d(i+1); i = i + 2",
     "      if gR(reg) then i = target end",
     "    end",
     "  end",
