@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Solaraph — Lua Obfuscator</title>
+<style>
+  :root{
+    --bg:#0c0c0d;
+    --bg-2:#101012;
+    --panel:#161618;
+    --panel-2:#1c1c20;
+    --panel-3:#242428;
+    --line:#2a2a2e;
+    --line-2:#38383e;
+    --gray:#8a8a90;
+    --gray-2:#5a5a60;
+    --gray-3:#3a3a40;
+    --white:#f4f4f5;
+    --radius:16px;
+    --mono:"SF Mono",ui-monospace,"JetBrains Mono","Cascadia Code",Consolas,Menlo,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --glow:0 0 0 1px rgba(244,244,245,.04), 0 8px 40px -12px rgba(0,0,0,.7);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--bg);color:var(--white);font-family:var(--sans);
+    font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;overflow:hidden;
+    position:relative;
+  }
+  /* ambient background decorations */
+  body::before,body::after{
+    content:"";position:fixed;border-radius:50%;filter:blur(120px);z-index:0;pointer-events:none;
+  }
+  body::before{width:520px;height:520px;top:-180px;left:-120px;
+    background:radial-gradient(circle,rgba(255,255,255,.05),transparent 70%);}
+  body::after{width:460px;height:460px;bottom:-200px;right:-140px;
+    background:radial-gradient(circle,rgba(138,138,144,.06),transparent 70%);}
+  .noise{
+    position:fixed;inset:0;z-index:0;opacity:.025;pointer-events:none;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+  .app{position:relative;z-index:1;display:flex;flex-direction:column;height:100vh;max-width:1240px;margin:0 auto;padding:22px;gap:18px}
+
+  /* ---------- header ---------- */
+  header{display:flex;align-items:center;gap:14px;animation:fadeDown .5s ease both}
+  .logo{width:38px;height:38px;flex:0 0 auto;filter:drop-shadow(0 2px 8px rgba(0,0,0,.5))}
+  .logo .core{animation:pulse 4s ease-in-out infinite}
+  .brand{display:flex;flex-direction:column}
+  .brand h1{margin:0;font-size:19px;font-weight:600;letter-spacing:.4px;
+    background:linear-gradient(180deg,#ffffff,#b8b8be);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .brand span{color:var(--gray);font-size:12px;letter-spacing:.2px}
+  .badge{margin-left:auto;display:flex;align-items:center;gap:7px;font-size:11px;color:var(--gray);
+    border:1px solid var(--line);background:var(--panel);padding:6px 11px;border-radius:20px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--gray-2);box-shadow:0 0 0 0 rgba(244,244,245,.4)}
+  .dot.live{background:#e8e8ea;animation:blip 2s ease-in-out infinite}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;flex:1;min-height:0}
+  @media (max-width:860px){.grid{grid-template-columns:1fr}.app{overflow:auto}body{overflow:auto}}
+
+  .panel{
+    background:linear-gradient(180deg,var(--panel),var(--bg-2));
+    border:1px solid var(--line);border-radius:var(--radius);
+    display:flex;flex-direction:column;min-height:0;overflow:hidden;box-shadow:var(--glow);
+    animation:fadeUp .5s ease both;
+  }
+  .panel:nth-child(2){animation-delay:.08s}
+  .panel-head{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:13px 15px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,rgba(255,255,255,.015),transparent);
+  }
+  .panel-head .title{display:flex;align-items:center;gap:9px;font-weight:600;font-size:13px;letter-spacing:.2px}
+  .panel-head .title svg{width:16px;height:16px;color:var(--gray)}
+  .actions{display:flex;gap:8px}
+
+  button{
+    font-family:var(--sans);font-size:12.5px;font-weight:500;cursor:pointer;
+    display:inline-flex;align-items:center;gap:6px;position:relative;
+    background:var(--panel-2);color:var(--white);border:1px solid var(--line);
+    padding:8px 13px;border-radius:10px;transition:.16s ease;
+  }
+  button:hover{border-color:var(--line-2);background:var(--panel-3);transform:translateY(-1px)}
+  button:active{transform:translateY(0)}
+  button:disabled{opacity:.35;cursor:not-allowed;transform:none}
+  button svg{width:14px;height:14px}
+  button.primary{background:linear-gradient(180deg,#fbfbfc,#e4e4e8);color:#0e0e10;border-color:#fff;
+    box-shadow:0 4px 16px -6px rgba(255,255,255,.3)}
+  button.primary:hover{background:linear-gradient(180deg,#fff,#eaeaee)}
+
+  .drop{flex:1;position:relative;display:flex;flex-direction:column;min-height:0}
+  .dropzone{
+    position:absolute;inset:10px;z-index:5;display:none;
+    align-items:center;justify-content:center;flex-direction:column;gap:12px;
+    background:rgba(12,12,13,.85);backdrop-filter:blur(4px);
+    border:2px dashed var(--line-2);border-radius:12px;color:var(--gray);font-size:13px;pointer-events:none;
+  }
+  .drop.dragging .dropzone{display:flex;animation:zoomIn .2s ease}
+  .drop.dragging .dropzone svg{animation:bob 1.2s ease-in-out infinite}
+  .dropzone svg{width:44px;height:44px;color:var(--gray)}
+  .dropzone b{color:var(--white);font-weight:600}
+
+  textarea{
+    flex:1;width:100%;resize:none;border:0;outline:0;background:transparent;
+    color:var(--white);font-family:var(--mono);font-size:13px;line-height:1.65;
+    padding:16px;tab-size:2;white-space:pre;overflow:auto;
+  }
+  textarea::placeholder{color:var(--gray-2)}
+  textarea[readonly]{color:#d2d2d7}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:var(--gray-3);border-radius:8px;border:2px solid transparent;background-clip:content-box}
+  ::-webkit-scrollbar-thumb:hover{background:var(--gray-2);background-clip:content-box}
+
+  .foot{
+    display:flex;align-items:center;justify-content:space-between;gap:12px;
+    padding:12px 15px;border-top:1px solid var(--line);color:var(--gray);font-size:12px;flex-wrap:wrap;
+    background:linear-gradient(0deg,rgba(255,255,255,.01),transparent);
+  }
+  .flags{display:flex;gap:10px 16px;flex-wrap:wrap}
+
+  /* ---------- custom toggle switch ---------- */
+  .flag{display:flex;align-items:center;gap:9px;cursor:pointer;user-select:none;color:var(--gray);
+    font-size:12px;transition:.15s color}
+  .flag:hover{color:var(--white)}
+  .flag input{position:absolute;opacity:0;width:0;height:0}
+  .switch{
+    width:34px;height:19px;border-radius:20px;background:var(--panel-3);
+    border:1px solid var(--line-2);position:relative;flex:0 0 auto;transition:.2s ease;
+  }
+  .switch::after{
+    content:"";position:absolute;top:1.5px;left:1.5px;width:14px;height:14px;border-radius:50%;
+    background:var(--gray);transition:.2s cubic-bezier(.4,.1,.3,1.3);box-shadow:0 1px 3px rgba(0,0,0,.5);
+  }
+  .flag input:checked + .switch{background:linear-gradient(180deg,#f2f2f4,#d6d6da);border-color:#fff}
+  .flag input:checked + .switch::after{transform:translateX(15px);background:#101012}
+  .flag input:focus-visible + .switch{box-shadow:0 0 0 3px rgba(244,244,245,.15)}
+
+  .status{font-family:var(--mono);font-size:11.5px;transition:.2s;min-height:14px}
+  .status.ok{color:var(--white)}
+  .status.err{color:#d59a9a}
+  .status.busy{color:var(--gray)}
+  .status.busy::after{content:"";display:inline-block;width:8px;text-align:left;animation:dots 1.2s steps(4) infinite}
+  .bar{display:flex;align-items:center;gap:12px}
+  .hint{color:var(--gray-2);font-size:11.5px;font-family:var(--mono)}
+
+  .file-list{max-height:140px;overflow:auto;border-top:1px solid var(--line);padding:6px;display:none;
+    animation:fadeUp .25s ease}
+  .file-list.show{display:block}
+  .file-item{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:9px;cursor:pointer;
+    color:var(--gray);font-family:var(--mono);font-size:12px;transition:.13s}
+  .file-item:hover{background:var(--panel-2);color:var(--white)}
+  .file-item svg{width:14px;height:14px;flex:0 0 auto;color:var(--gray-2)}
+  .file-item:hover svg{color:var(--gray)}
+  .file-item .sz{margin-left:auto;color:var(--gray-2);font-size:11px}
+
+  /* ---------- animations ---------- */
+  @keyframes fadeDown{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:none}}
+  @keyframes fadeUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+  @keyframes zoomIn{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:none}}
+  @keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+  @keyframes pulse{0%,100%{opacity:.55}50%{opacity:1}}
+  @keyframes blip{0%,100%{box-shadow:0 0 0 0 rgba(244,244,245,.35)}50%{box-shadow:0 0 0 5px rgba(244,244,245,0)}}
+  @keyframes dots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="noise"></div>
+<div class="app">
+  <header>
+    <svg class="logo" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <rect x="1" y="1" width="30" height="30" rx="9" fill="#161618" stroke="#2a2a2e"/>
+      <path d="M16 6 L25 16 L16 26 L7 16 Z" fill="#f4f4f5" opacity=".92"/>
+      <path class="core" d="M16 11 L20 16 L16 21 L12 16 Z" fill="#8a8a90"/>
+    </svg>
+    <div class="brand">
+      <h1>Solaraph</h1>
+      <span>Lua obfuscator · virtual machine</span>
+    </div>
+    <div class="badge"><span class="dot" id="dot"></span><span id="badgeText">initializing</span></div>
+  </header>
+
+  <div class="grid">
+    <!-- INPUT -->
+    <div class="panel">
+      <div class="panel-head">
+        <div class="title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+          Source
+        </div>
+        <div class="actions">
+          <button id="btnOpen" title="Open a file">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z"/></svg>
+            Open
+          </button>
+          <button id="btnClear" title="Clear">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>
+            Clear
+          </button>
+        </div>
+      </div>
+      <div class="drop" id="drop">
+        <div class="dropzone">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5-5 5 5"/><path d="M12 5v12"/></svg>
+          <div>Drop a file or folder — <b>.lua .txt</b> and more</div>
+        </div>
+        <textarea id="input" spellcheck="false" placeholder="-- Paste your Lua here, or drag a file / folder in&#10;local function hello(name)&#10;  print(&quot;Hello, &quot; .. name)&#10;end&#10;hello(&quot;world&quot;)"></textarea>
+      </div>
+      <div class="file-list" id="fileList"></div>
+      <div class="foot">
+        <div class="flags" id="flags"></div>
+      </div>
+    </div>
+
+    <!-- OUTPUT -->
+    <div class="panel">
+      <div class="panel-head">
+        <div class="title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6v6H9z"/></svg>
+          Obfuscated
+        </div>
+        <div class="actions">
+          <button id="btnCopy" title="Copy output" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            Copy
+          </button>
+          <button id="btnDownload" class="primary" title="Download output" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+            Download
+          </button>
+        </div>
+      </div>
+      <div class="drop">
+        <textarea id="output" spellcheck="false" readonly placeholder="-- Output appears here"></textarea>
+      </div>
+      <div class="foot">
+        <div class="bar">
+          <button id="btnRun" class="primary">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m5 3 14 9-14 9V3z"/></svg>
+            Obfuscate
+          </button>
+          <span class="status busy" id="status">loading engine</span>
+        </div>
+        <span class="hint" id="sizes"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/fengari-web@0.1.4/dist/fengari-web.js"></script>
+<script>
+(function(){
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const input=$("input"), output=$("output"), statusEl=$("status"), sizes=$("sizes");
+  const btnRun=$("btnRun"), btnDownload=$("btnDownload"), btnCopy=$("btnCopy");
+  const btnOpen=$("btnOpen"), btnClear=$("btnClear"), drop=$("drop"), fileList=$("fileList");
+  const dot=$("dot"), badgeText=$("badgeText");
+
+  // ---- Flags (match solaraph.lua CLI) ----
+  const FLAGS=[
+    ["fold","Fold",true],["flatten","Flatten",true],["rename","Rename",true],
+    ["numbers","Numbers",true],["vm","VM",true],["strings","Strings",true],
+    ["dead","Dead code",true],["minify","Minify",true],
+  ];
+  const flagsBox=$("flags");
+  FLAGS.forEach(([k,label,def])=>{
+    const l=document.createElement("label"); l.className="flag";
+    l.innerHTML=`<input type="checkbox" data-flag="${k}" ${def?"checked":""}/><span class="switch"></span>${label}`;
+    flagsBox.appendChild(l);
+  });
+  const getFlags=()=>{const o={};document.querySelectorAll("[data-flag]").forEach(c=>o[c.dataset.flag]=c.checked);return o;};
+
+  function setStatus(msg,cls){statusEl.textContent=msg;statusEl.className="status"+(cls?" "+cls:"");}
+  function setBadge(txt,live){badgeText.textContent=txt;dot.className="dot"+(live?" live":"");}
+
+  // ---- Engine loading ----
+  const MODULES=["lexer","parser","constfold","cflatten","renamer","numenc","stringenc","vm","generator"];
+  const OPTIONAL=["deadcode"];
+  let engineReady=false, luaSources={}, hasDead=false;
+
+  async function fetchModule(m,optional){
+    try{const r=await fetch(m+".lua",{cache:"no-store"});if(!r.ok)throw 0;luaSources[m]=await r.text();return true;}
+    catch(e){if(!optional)throw new Error(m+".lua not found");return false;}
+  }
+  async function loadEngine(){
+    try{
+      await Promise.all(MODULES.map(m=>fetchModule(m,false)));
+      hasDead=await fetchModule("deadcode",true);
+      engineReady=true; setStatus("ready","ok"); setBadge("ready",true);
+    }catch(e){
+      setStatus("serve this page from the lua-obfuscator folder","err"); setBadge("offline",false);
+    }
+  }
+
+  // ---- Pipeline via Fengari ----
+  function obfuscate(source, flags){
+    const L=fengari.lua, lauxlib=fengari.lauxlib, lualib=fengari.lualib, to=fengari.to_luastring;
+    const st=lauxlib.luaL_newstate(); lualib.luaL_openlibs(st);
+    L.lua_getglobal(st,to("package")); L.lua_getfield(st,-1,to("preload"));
+    const mods=MODULES.concat(hasDead?["deadcode"]:[]);
+    mods.forEach(m=>{
+      if(lauxlib.luaL_loadbuffer(st,to(luaSources[m]),null,to("="+m))!==L.LUA_OK) throw new Error("load "+m+": "+s2(st));
+      L.lua_setfield(st,-2,to(m));
+    });
+    L.lua_pop(st,2);
+    const driver=`
+      local Lexer=require("lexer"); local Parser=require("parser")
+      local ConstFold=require("constfold"); local CFlatten=require("cflatten")
+      local Renamer=require("renamer"); local NumEnc=require("numenc")
+      local StringEnc=require("stringenc"); local VM=require("vm")
+      local Generator=require("generator")
+      local ok_dead, DeadCode = pcall(require, "deadcode")
+      math.randomseed(os.time())
+      local src, opts = ...
+      local tokens=Lexer.tokenize(src)
+      local ast=Parser.parse(tokens)
+      if opts.fold then ast=ConstFold.fold(ast) end
+      if opts.flatten then ast=CFlatten.flatten(ast) end
+      if opts.rename then ast=Renamer.rename(ast) end
+      if opts.numbers then ast=NumEnc.obfuscate(ast) end
+      if opts.vm then ast=VM.transform(ast) end
+      if opts.strings then ast=StringEnc.encrypt(ast) end
+      if opts.dead and ok_dead and DeadCode then ast=DeadCode.inject(ast) end
+      local body=Generator.generate(ast, opts.minify)
+      local prelude=""
+      if opts.vm and VM.prelude then prelude=prelude..VM.prelude() end
+      if opts.strings and StringEnc.prelude then prelude=prelude..StringEnc.prelude() end
+      return prelude..body
+    `;
+    if(lauxlib.luaL_loadstring(st,to(driver))!==L.LUA_OK) throw new Error("driver: "+s2(st));
+    L.lua_pushstring(st,to(source));
+    L.lua_newtable(st);
+    Object.entries(flags).forEach(([k,v])=>{L.lua_pushboolean(st,v?1:0);L.lua_setfield(st,-2,to(k));});
+    if(L.lua_pcall(st,2,1,0)!==L.LUA_OK) throw new Error(s2(st));
+    const result=fengari.lua.lua_tojsstring(st,-1); L.lua_pop(st,1); return result;
+  }
+  function s2(st){return fengari.lua.lua_tojsstring(st,-1)||"error";}
+
+  function run(){
+    if(!engineReady){setStatus("engine not loaded","err");return;}
+    const src=input.value;
+    if(!src.trim()){setStatus("nothing to obfuscate","err");return;}
+    setStatus("obfuscating","busy"); btnRun.disabled=true;
+    setTimeout(()=>{
+      try{
+        const t0=performance.now();
+        const out=obfuscate(src,getFlags());
+        const ms=Math.round(performance.now()-t0);
+        output.value=out; btnDownload.disabled=false; btnCopy.disabled=false;
+        setStatus("done in "+ms+" ms","ok");
+        sizes.textContent=new Blob([src]).size+" B → "+new Blob([out]).size+" B";
+      }catch(e){
+        output.value=""; btnDownload.disabled=true; btnCopy.disabled=true;
+        setStatus(String(e.message||e),"err"); sizes.textContent="";
+      }finally{ btnRun.disabled=false; }
+    },20);
+  }
+
+  function download(){
+    const out=output.value; if(!out) return;
+    const blob=new Blob([out],{type:"text/plain;charset=utf-8"});
+    const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+    a.download=(currentName?currentName.replace(/\.[^.]+$/,""):"output")+".obf.lua";
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href);
+  }
+
+  // ---- File handling (UTF-8, any text format) ----
+  let currentName=null;
+  const TEXT_RE=/\.(lua|txt|luau|text|md|json|js|py|ts|cfg|conf|ini|log)$/i;
+  function readAsText(file){
+    return new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>res(fr.result);fr.onerror=()=>rej(fr.error);fr.readAsText(file,"utf-8");});
+  }
+  async function loadFile(file){currentName=file.name;input.value=await readAsText(file);setStatus("loaded "+file.name,"ok");sizes.textContent="";}
+  function showFileList(files){
+    const texts=[...files].filter(f=>TEXT_RE.test(f.name));
+    if(texts.length===0){setStatus("no supported text files found","err");return;}
+    if(texts.length===1){fileList.classList.remove("show");loadFile(texts[0]);return;}
+    fileList.innerHTML="";
+    texts.forEach(f=>{
+      const item=document.createElement("div"); item.className="file-item";
+      const rel=f.webkitRelativePath||f.name;
+      item.innerHTML=`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg><span>${rel}</span><span class="sz">${f.size} B</span>`;
+      item.onclick=()=>{fileList.classList.remove("show");loadFile(f);};
+      fileList.appendChild(item);
+    });
+    fileList.classList.add("show"); setStatus("select a file ("+texts.length+" found)","ok");
+  }
+
+  const filePick=document.createElement("input");
+  filePick.type="file"; filePick.accept=".lua,.txt,.luau,.text,.md,.json,.js,.py,.ts,.cfg,.conf,.ini,.log,text/*";
+  filePick.style.display="none";
+  filePick.onchange=()=>{if(filePick.files.length)showFileList(filePick.files);};
+  document.body.appendChild(filePick);
+  btnOpen.onclick=()=>filePick.click();
+
+  ["dragenter","dragover"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add("dragging");}));
+  ["dragleave","drop"].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();if(ev==="dragleave"&&drop.contains(e.relatedTarget))return;drop.classList.remove("dragging");}));
+  drop.addEventListener("drop",async e=>{
+    e.preventDefault(); drop.classList.remove("dragging");
+    const dt=e.dataTransfer;
+    const entries=[...(dt.items||[])].map(it=>it.webkitGetAsEntry&&it.webkitGetAsEntry()).filter(Boolean);
+    if(entries.some(en=>en&&en.isDirectory)){const files=[];for(const en of entries){await walkEntry(en,files);}showFileList(files);return;}
+    if(dt.files&&dt.files.length)showFileList(dt.files);
+  });
+  function walkEntry(entry,out,prefix=""){
+    return new Promise(res=>{
+      if(entry.isFile){entry.file(f=>{try{Object.defineProperty(f,"webkitRelativePath",{value:prefix+entry.name});}catch(_){}out.push(f);res();});}
+      else if(entry.isDirectory){const rd=entry.createReader();rd.readEntries(async ents=>{for(const en of ents){await walkEntry(en,out,prefix+entry.name+"/");}res();});}
+      else res();
+    });
+  }
+
+  btnClear.onclick=()=>{input.value="";output.value="";currentName=null;fileList.classList.remove("show");btnDownload.disabled=true;btnCopy.disabled=true;sizes.textContent="";setStatus(engineReady?"ready":"loading engine",engineReady?"ok":"busy");};
+  btnRun.onclick=run;
+  btnDownload.onclick=download;
+  btnCopy.onclick=async()=>{try{await navigator.clipboard.writeText(output.value);setStatus("copied","ok");}catch(_){setStatus("copy failed","err");}};
+  input.addEventListener("keydown",e=>{if((e.ctrlKey||e.metaKey)&&e.key==="Enter")run();});
+
+  loadEngine();
+})();
+</script>
+</body>
+</html>
