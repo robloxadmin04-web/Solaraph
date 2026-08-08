@@ -1,66 +1,48 @@
 -- renamer.lua
--- Obfuscation pass 1: variable renaming (scope-aware)
--- Pinapalitan ang lahat ng LOCAL variable ng walang-kwentang pangalan.
--- Hindi ginagalaw ang globals/built-ins (print, pairs, atbp).
+-- Obfuscation pass 1: scope-aware variable renaming.
+-- Updated para sa bagong AST: tables, methods, multiple assignment.
 
 local Renamer = {}
 Renamer.__index = Renamer
 
 function Renamer.new()
   local self = setmetatable({}, Renamer)
-  self.counter = 0          -- pambilang para sa bagong pangalan
-  -- scopes: stack ng mapa. Bawat scope may sariling { orihinal = bago }
-  self.scopes = { {} }      -- global scope muna
+  self.counter = 0
+  self.scopes = { {} }   -- global scope
   return self
 end
 
--- Gumawa ng bagong walang-kwentang pangalan: _v1, _v2, ...
 function Renamer:freshName()
   self.counter = self.counter + 1
   return "_v" .. self.counter
 end
 
--- Pumasok sa bagong scope (hal. loob ng function/loop)
-function Renamer:pushScope()
-  table.insert(self.scopes, {})
-end
+function Renamer:pushScope() table.insert(self.scopes, {}) end
+function Renamer:popScope()  table.remove(self.scopes) end
 
--- Umalis sa scope
-function Renamer:popScope()
-  table.remove(self.scopes)
-end
-
--- Itala ang bagong local: orihinal -> bagong pangalan (sa kasalukuyang scope)
 function Renamer:declare(name)
   local newName = self:freshName()
   self.scopes[#self.scopes][name] = newName
   return newName
 end
 
--- Hanapin ang bagong pangalan ng isang variable.
--- Titingnan mula sa pinakaloob na scope palabas.
--- Kung wala sa kahit anong scope -> global/built-in, ibalik nil.
 function Renamer:resolve(name)
   for i = #self.scopes, 1, -1 do
     local mapped = self.scopes[i][name]
     if mapped then return mapped end
   end
-  return nil  -- global, huwag galawin
+  return nil
 end
 
--- ============ TREE WALKING ============
+-- ============ EXPRESSIONS ============
 
--- Baguhin ang isang expression node (in-place)
 function Renamer:transformExpr(node)
   if node == nil then return end
   local k = node.kind
 
   if k == "Variable" then
     local mapped = self:resolve(node.name)
-    if mapped then
-      node.name = mapped   -- local, palitan
-    end
-    -- kung nil (global), iwanan lang
+    if mapped then node.name = mapped end
 
   elseif k == "UnaryOp" then
     self:transformExpr(node.operand)
@@ -73,60 +55,67 @@ function Renamer:transformExpr(node)
     self:transformExpr(node.callee)
     for _, a in ipairs(node.args) do self:transformExpr(a) end
 
+  elseif k == "MethodCall" then
+    self:transformExpr(node.object)   -- ang method name mismo ay hindi variable
+    for _, a in ipairs(node.args) do self:transformExpr(a) end
+
   elseif k == "Index" then
     self:transformExpr(node.object)
     if node.index then self:transformExpr(node.index) end
-    -- node.field (.name) ay hindi variable, huwag galawin
+    -- node.field (.name) ay hindi variable
+
+  elseif k == "Table" then
+    for _, f in ipairs(node.fields) do
+      if f.kind == "keyed" then self:transformExpr(f.key) end
+      self:transformExpr(f.value)
+      -- f.name (named field) ay key sa table, HINDI variable — huwag galawin
+    end
 
   elseif k == "Function" then
-    -- anonymous function: bagong scope para sa params
     self:pushScope()
     for i, p in ipairs(node.params) do
-      if p ~= "..." then
-        node.params[i] = self:declare(p)
-      end
+      if p ~= "..." then node.params[i] = self:declare(p) end
     end
     self:transformBlock(node.body)
     self:popScope()
   end
-  -- Number, String, Literal: walang gagawin
+  -- Number, String, Literal, Vararg, Raw: walang gagawin
 end
 
--- Baguhin ang isang statement node
+-- ============ STATEMENTS ============
+
 function Renamer:transformStatement(node)
   local k = node.kind
 
   if k == "LocalAssignment" then
-    -- IMPORTANTE: i-transform muna ang value BAGO i-declare ang bagong pangalan.
-    -- Kasi sa `local x = x + 1`, ang `x` sa kanan ay ang LUMANG x (o global).
-    self:transformExpr(node.value)
-    node.name = self:declare(node.name)
+    -- i-transform muna ang values BAGO i-declare (ang kanan ay lumang scope)
+    if node.values then
+      for _, v in ipairs(node.values) do self:transformExpr(v) end
+    end
+    for i, name in ipairs(node.names) do
+      node.names[i] = self:declare(name)
+    end
 
   elseif k == "Assignment" then
-    self:transformExpr(node.value)
-    self:transformExpr(node.target)
+    for _, v in ipairs(node.values) do self:transformExpr(v) end
+    for _, t in ipairs(node.targets) do self:transformExpr(t) end
 
   elseif k == "LocalFunction" then
-    -- Ang pangalan ng function ay declared sa KASALUKUYANG scope (para ma-recursion).
     node.name = self:declare(node.name)
     node.func.name = node.name
-    -- bagong scope para sa params + body
     self:pushScope()
     for i, p in ipairs(node.func.params) do
-      if p ~= "..." then
-        node.func.params[i] = self:declare(p)
-      end
+      if p ~= "..." then node.func.params[i] = self:declare(p) end
     end
     self:transformBlock(node.func.body)
     self:popScope()
 
   elseif k == "FunctionDeclaration" then
-    -- global function name: huwag palitan (pwedeng tinatawag mula labas)
+    -- ang target (a.b.c o obj) ay pwedeng may local base — i-resolve
+    self:transformExpr(node.target)
     self:pushScope()
     for i, p in ipairs(node.func.params) do
-      if p ~= "..." then
-        node.func.params[i] = self:declare(p)
-      end
+      if p ~= "..." then node.func.params[i] = self:declare(p) end
     end
     self:transformBlock(node.func.body)
     self:popScope()
@@ -150,23 +139,32 @@ function Renamer:transformStatement(node)
     self:transformBlock(node.body)
     self:popScope()
 
+  elseif k == "Repeat" then
+    -- IMPORTANTE: sa repeat, ang until-cond ay nakikita ang locals ng body,
+    -- kaya iisang scope lang ang body at cond.
+    self:pushScope()
+    self:transformBlock(node.body)
+    self:transformExpr(node.cond)
+    self:popScope()
+
+  elseif k == "Do" then
+    self:pushScope()
+    self:transformBlock(node.body)
+    self:popScope()
+
   elseif k == "NumericFor" then
-    -- ang start/stop/step ay sa LABAS na scope
     self:transformExpr(node.startExpr)
     self:transformExpr(node.stopExpr)
     if node.stepExpr then self:transformExpr(node.stepExpr) end
-    -- bagong scope: ang loop variable ay local sa loob
     self:pushScope()
     node.var = self:declare(node.var)
     self:transformBlock(node.body)
     self:popScope()
 
   elseif k == "GenericFor" then
-    self:transformExpr(node.iter)
+    for _, it in ipairs(node.iters) do self:transformExpr(it) end
     self:pushScope()
-    for i, n in ipairs(node.names) do
-      node.names[i] = self:declare(n)
-    end
+    for i, n in ipairs(node.names) do node.names[i] = self:declare(n) end
     self:transformBlock(node.body)
     self:popScope()
 
@@ -187,7 +185,6 @@ function Renamer:transformBlock(statements)
   end
 end
 
--- Pangunahing entry point
 function Renamer.rename(ast)
   local self = Renamer.new()
   self:transformBlock(ast.body)

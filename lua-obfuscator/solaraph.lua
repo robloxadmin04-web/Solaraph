@@ -1,41 +1,43 @@
 -- solaraph.lua
--- CLI: lua solaraph.lua <input.lua> [output.lua] [--no-minify]
---
--- Halimbawa:
---   lua solaraph.lua script.lua
---   lua solaraph.lua script.lua out.lua
---   lua solaraph.lua script.lua out.lua --no-minify
+-- CLI: lua solaraph.lua <input.lua> [output.lua] [flags]
+-- Flags: --no-minify  --no-strings  --no-numbers  --no-rename
 
 local Lexer     = require("lexer")
 local Parser    = require("parser")
 local Renamer   = require("renamer")
+local NumEnc    = require("numenc")
+local StringEnc = require("stringenc")
 local Generator = require("generator")
 
--- ===== Basahin ang mga argumento =====
+math.randomseed(os.time())
+
+-- ===== Argumento at flags =====
 local inputPath  = arg[1]
-local outputPath = arg[2]
-local minify     = true
+local outputPath = nil
+local opts = { minify = true, rename = true, strings = true, numbers = true }
 
--- suriin ang mga flag
 for i = 2, #arg do
-  if arg[i] == "--no-minify" then minify = false end
+  local a = arg[i]
+  if a == "--no-minify"  then opts.minify  = false
+  elseif a == "--no-rename"  then opts.rename  = false
+  elseif a == "--no-strings" then opts.strings = false
+  elseif a == "--no-numbers" then opts.numbers = false
+  elseif a:sub(1, 2) ~= "--" then outputPath = a
+  end
 end
--- kung ang arg[2] ay isang flag, walang output path na binigay
-if outputPath == "--no-minify" then outputPath = nil end
 
--- ===== Tulong kung walang input =====
 if not inputPath then
-  print("Solaraph — Lua obfuscator")
-  print("Gamit: lua solaraph.lua <input.lua> [output.lua] [--no-minify]")
+  print("Solaraph - Lua obfuscator")
+  print("Gamit: lua solaraph.lua <input.lua> [output.lua] [flags]")
+  print("Flags: --no-minify  --no-strings  --no-numbers  --no-rename")
   os.exit(1)
 end
 
--- default na output path: <input>.obf.lua
 if not outputPath then
   outputPath = inputPath:gsub("%.lua$", "") .. ".obf.lua"
 end
 
--- ===== Basahin ang input =====
+-- ===== Basahin =====
 local f = io.open(inputPath, "r")
 if not f then
   print("MALI: hindi mabuksan ang file: " .. inputPath)
@@ -44,12 +46,20 @@ end
 local source = f:read("*a")
 f:close()
 
--- ===== Obfuscate (may error handling) =====
+-- ===== Obfuscate =====
 local ok, result = pcall(function()
   local tokens = Lexer.tokenize(source)
   local ast    = Parser.parse(tokens)
-  ast = Renamer.rename(ast)
-  return Generator.generate(ast, minify)
+
+  if opts.rename  then ast = Renamer.rename(ast) end
+  if opts.numbers then ast = NumEnc.obfuscate(ast) end
+  if opts.strings then ast = StringEnc.encrypt(ast) end
+
+  local body = Generator.generate(ast, opts.minify)
+  if opts.strings then
+    return StringEnc.prelude() .. body
+  end
+  return body
 end)
 
 if not ok then
@@ -59,7 +69,7 @@ if not ok then
   os.exit(1)
 end
 
--- ===== Isulat ang output =====
+-- ===== Isulat =====
 local out = io.open(outputPath, "w")
 if not out then
   print("MALI: hindi maisulat ang output: " .. outputPath)
@@ -69,9 +79,10 @@ out:write(result)
 out:close()
 
 -- ===== Ulat =====
-local origSize = #source
-local newSize  = #result
-print("Solaraph — tapos!")
-print("  Input:  " .. inputPath  .. " (" .. origSize .. " bytes)")
-print("  Output: " .. outputPath .. " (" .. newSize  .. " bytes)")
-print("  Minify: " .. tostring(minify))
+print("Solaraph - tapos!")
+print("  Input:  " .. inputPath  .. " (" .. #source .. " bytes)")
+print("  Output: " .. outputPath .. " (" .. #result .. " bytes)")
+print("  Passes: rename=" .. tostring(opts.rename)
+      .. " numbers=" .. tostring(opts.numbers)
+      .. " strings=" .. tostring(opts.strings)
+      .. " minify=" .. tostring(opts.minify))
