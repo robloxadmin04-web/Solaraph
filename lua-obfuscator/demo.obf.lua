@@ -1,0 +1,1 @@
+local function _v1(_v2) if _v2 <= 1 then return 1 end return _v2 * _v1(_v2 - 1) end local function _v3(_v4) print("Kumusta, " .. _v4) end _v3("Solaraph") for _v5 = 1, 5 do print(_v5 .. "! = " .. _v1(_v5)) end 
