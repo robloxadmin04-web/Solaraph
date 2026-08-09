@@ -28,9 +28,9 @@ local function fail() error(UNSUPPORTED, 0) end
 
 local protos
 local __keysrc
-local OPMAP    -- logical opcode (1..36) -> physical number (random per build)
+local OPMAP    -- logical opcode (1..34) -> physical number (random per build)
 local function buildOpMap(seed)
-  local n = 36
+  local n = 34
   local phys = {}
   for i = 1, n do phys[i] = i end
   local s = seed % 2147483648
@@ -60,7 +60,7 @@ Compiler.__index = Compiler
 local function newCompiler(parent)
   return setmetatable({
     code = {}, K = {},
-    free = 0, nlocals = 0, np = 0,
+    free = 0, nlocals = 0,
     scopes = { {} },
     parent = parent,
     upvals = {}, captured = {}, boxed = {},
@@ -391,41 +391,21 @@ function Compiler:compileStmt(node)
     self.free = saved
 
   elseif k == "GenericFor" then
-    -- Generic-for is virtualized only for the canonical Roblox-safe pairs/ipairs shape.
-    -- All other iterator shapes intentionally fail so VM.transform() safely falls back
-    -- to the original AST instead of producing incorrect semantics.
-    if #node.iters ~= 1 then fail() end
-    local iter = node.iters[1]
-    if not iter or iter.kind ~= "Call" or not iter.callee or iter.callee.kind ~= "Variable" then fail() end
-    local iterName = iter.callee.name
-    if iterName ~= "pairs" and iterName ~= "ipairs" then fail() end
-
     self:pushScope()
     local fReg = self:declare("(f)")
-    local stateReg = self:declare("(state)")
-    local ctrlReg = self:declare("(ctrl)")
-
-    -- pairs(t)/ipairs(t) returns iterator, state, initial-control.
-    local saved = self.free
-    local initBase = self:reserve(3)
-    local callee = self:ceTop(iter.callee)
-    for _, arg in ipairs(iter.args) do self:ceTop(arg) end
-    self:emit(OPMAP[21], callee, #iter.args, 3)
-    self:emit(OPMAP[2], fReg, callee)
-    self:emit(OPMAP[2], stateReg, callee + 1)
-    self:emit(OPMAP[2], ctrlReg, callee + 2)
+    local sf = self.free
+    local iterRegs = {}
+    for _, e in ipairs(node.iters) do table.insert(iterRegs, self:ceTop(e)) end
+    self:emit(OPMAP[2], fReg, iterRegs[1])
     self.free = self.nlocals
-
     local varRegs = {}
     for _, nm in ipairs(node.names) do table.insert(varRegs, self:declare(nm)) end
     local top = self:here() + 1
     local sf2 = self.free
-    local callBase = self:reserve(#node.names)
-    self:emit(OPMAP[33], callBase, fReg, stateReg, ctrlReg, #node.names)
-    for idx, nm in ipairs(node.names) do
-      self:emit(OPMAP[2], varRegs[idx], callBase + idx - 1)
-    end
-    if #node.names > 0 then self:emit(OPMAP[2], ctrlReg, callBase) end
+    local callBase = self:reserve(1)
+    self:emit(OPMAP[2], callBase, fReg)
+    self:emit(OPMAP[33], callBase, 0, #node.names)
+    for idx, nm in ipairs(node.names) do self:emit(OPMAP[2], varRegs[idx], callBase + idx - 1) end
     self.free = sf2
     local exit = self:emitJmpIfNot(varRegs[1])
     self.free = self.nlocals
@@ -456,12 +436,11 @@ end
 compileFunction = function(parent, params, body)
   local c = newCompiler(parent)
   for _, p in ipairs(params) do if p == "..." then fail() end; c:declare(p) end
-  c.np = #params
   c:compileBlock(body)
-  c:emit(OPMAP[23])
+  c:emit(23)
   local key = nextKey()
   local enc = encryptCode(c.code, key)
-  return addProto({ code = enc, K = c.K, upvals = c.upvals, boxed = c.boxed, np = c.np, key = key, sum = checksum(enc) })
+  return addProto({ code = enc, K = c.K, upvals = c.upvals, boxed = c.boxed, key = key, sum = checksum(enc) })
 end
 
 -- ===== Serialize proto tree -> Lua data literal =====
@@ -493,7 +472,7 @@ local function serializeProtos()
   for _, p in ipairs(protos) do
     table.insert(parts, "{c={" .. table.concat(p.code, ",") .. "},k=" .. serializeK(p.K)
       .. ",u=" .. serializeUpvals(p.upvals) .. ",b=" .. serializeBoxed(p.boxed)
-      .. ",np=" .. (p.np or 0) .. ",key=" .. p.key .. ",sum=" .. p.sum .. "}")
+      .. ",key=" .. p.key .. ",sum=" .. p.sum .. "}")
   end
   return "{" .. table.concat(parts, ",") .. "}"
 end
@@ -503,14 +482,14 @@ function VM.transform(ast)
   local ok, res = pcall(function()
     local mainC = newCompiler(nil)
     mainC:compileBlock(ast.body)
-    mainC:emit(OPMAP[23])
+    mainC:emit(23)
     local mkey = nextKey()
     local menc = encryptCode(mainC.code, mkey)
-    return addProto({ code = menc, K = mainC.K, upvals = mainC.upvals, boxed = mainC.boxed, np = 0, key = mkey, sum = checksum(menc) })
+    return addProto({ code = menc, K = mainC.K, upvals = mainC.upvals, boxed = mainC.boxed, key = mkey, sum = checksum(menc) })
   end)
   if not ok then VM._payload = nil; return ast end
   local opmapParts = {}
-  for logical = 1, 36 do table.insert(opmapParts, OPMAP[logical]) end
+  for logical = 1, 34 do table.insert(opmapParts, OPMAP[logical]) end
   VM._payload = { protoData = serializeProtos(), mainIndex = res, opmap = "{" .. table.concat(opmapParts, ",") .. "}" }
   ast.body = { { kind = "CallStatement", call = { kind = "Raw", text = "__vmmain()" } } }
   return ast
@@ -603,10 +582,10 @@ function VM.prelude()
     "    elseif op == 31 then gR(d(i))[gR(d(i+1))] = gR(d(i+2)); i = i + 3",
     "    elseif op == 32 then local __t = gR(d(i+1)); sR(d(i), __t[K[d(i+2)]]); sR(d(i)+1, __t); i = i + 3",
     "    elseif op == 33 then",
-    "      local base = d(i); local fReg = d(i+1); local stateReg = d(i+2); local ctrlReg = d(i+3); local ns = d(i+4); i = i + 5",
-    "      local f = gR(fReg); local state = gR(stateReg); local ctrl = gR(ctrlReg)",
-    "      local rv = { f(state, ctrl) }",
-    "      for w = 1, ns do sR(base + w - 1, rv[w]) end",
+    "      local base = d(i); local ns = d(i+2); i = i + 3",
+    "      local f = gR(base)",
+    "      local r1, r2 = f()",
+    "      sR(base, r1); if ns >= 2 then sR(base + 1, r2) end",
     "    elseif op == 34 then",
     "      local reg = d(i); local target = d(i+1); i = i + 2",
     "      if gR(reg) then i = target end",
