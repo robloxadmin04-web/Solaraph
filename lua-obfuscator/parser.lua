@@ -362,15 +362,12 @@ function Parser:parseFor()
   local body = self:parseBlock()
   self:expect("KEYWORD", "end")
 
-  -- Luau generalized iteration: kung isang iter expr lang AT hindi tawag sa
-  -- pairs/ipairs/next, i-wrap sa pairs() para gumana ang "for k,v in t do".
-  if #iters == 1 then
-    local it = iters[1]
-    local isPairsLike = it.kind == "Call" and it.callee and it.callee.kind == "Variable"
-      and (it.callee.name == "pairs" or it.callee.name == "ipairs" or it.callee.name == "next")
-    if not isPairsLike then
-      iters = { { kind = "Call", callee = { kind = "Variable", name = "pairs" }, args = { it } } }
-    end
+  -- Luau generalized iteration: `for k,v in someTable do` (a bare table value,
+  -- not a call) is wrapped in pairs() so it works under the standard protocol.
+  -- Function-call iterators (pairs, ipairs, gmatch, coroutine.wrap, custom
+  -- factories, ...) already return a proper iterator and must NOT be wrapped.
+  if #iters == 1 and iters[1].kind ~= "Call" then
+    iters = { { kind = "Call", callee = { kind = "Variable", name = "pairs" }, args = { iters[1] } } }
   end
 
   return { kind = "GenericFor", names = names, iters = iters, body = wrapContinue(body) }
