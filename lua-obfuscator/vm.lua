@@ -30,7 +30,7 @@ local protos
 local __keysrc
 local OPMAP    -- logical opcode (1..34) -> physical number (random per build)
 local function buildOpMap(seed)
-  local n = 34
+  local n = 36
   local phys = {}
   for i = 1, n do phys[i] = i end
   local s = seed % 2147483648
@@ -183,6 +183,10 @@ function Compiler:ceInto(node, dest)
     self.free = saved; if self.free < dest + 1 then self.free = dest + 1 end
 
   elseif k == "Call" then
+    -- Multi-value expansion of a last-arg call/vararg is not yet supported by
+    -- the fixed-argc call opcode; bail to safe fallback rather than truncate.
+    local last = node.args[#node.args]
+    if last and (last.kind == "Call" or last.kind == "Vararg") then fail() end
     local saved = self.free
     local base = self:ceTop(node.callee)
     for _, arg in ipairs(node.args) do self:ceTop(arg) end
@@ -229,6 +233,8 @@ function Compiler:ceInto(node, dest)
     self:emit(OPMAP[36], dest, 1)
 
   elseif k == "MethodCall" then
+    local last = node.args[#node.args]
+    if last and (last.kind == "Call" or last.kind == "Vararg") then fail() end
     local saved = self.free
     local objReg = self:ceTop(node.object)
     local base = self:reserve(1)
@@ -249,6 +255,12 @@ function Compiler:compileStmt(node)
   local k = node.kind
 
   if k == "LocalAssignment" then
+    -- local a,b,c = f() needs the call to expand into multiple names; the
+    -- fixed-argc call can't, so bail to safe fallback for that shape.
+    if node.values and #node.values > 0 and #node.names > #node.values then
+      local lastv = node.values[#node.values]
+      if lastv.kind == "Call" or lastv.kind == "Vararg" then fail() end
+    end
     local vs = {}
     if node.values then for _, v in ipairs(node.values) do table.insert(vs, self:ceTop(v)) end end
     local regs = {}
@@ -366,6 +378,10 @@ function Compiler:compileStmt(node)
     self:popScope()
 
   elseif k == "MultiAssign" then
+    if #node.values > 0 and #node.targets > #node.values then
+      local lastv = node.values[#node.values]
+      if lastv.kind == "Call" or lastv.kind == "Vararg" then fail() end
+    end
     local saved = self.free
     local valRegs = {}
     for _, v in ipairs(node.values) do table.insert(valRegs, self:ceTop(v)) end
@@ -391,23 +407,48 @@ function Compiler:compileStmt(node)
     self.free = saved
 
   elseif k == "GenericFor" then
+    -- Full generic-for protocol: explist -> f, s, control. Each step calls
+    -- f(s, control) wanting #names results; control = first result; stop on nil.
     self:pushScope()
-    local fReg = self:declare("(f)")
-    local sf = self.free
-    local iterRegs = {}
-    for _, e in ipairs(node.iters) do table.insert(iterRegs, self:ceTop(e)) end
-    self:emit(OPMAP[2], fReg, iterRegs[1])
+    local fReg    = self:declare("(f)")
+    local sReg    = self:declare("(s)")
+    local ctrlReg = self:declare("(ctrl)")
+    -- Single call iterator (pairs/ipairs/gmatch/custom factory): one call
+    -- yielding (iter, state, control). Bare-table iteration was already
+    -- wrapped in pairs() by the parser, so a single iter is always a Call here.
+    local it1 = node.iters[1]
+    if #node.iters == 1 and it1.kind == "Call" then
+      local call = node.iters[1]
+      local cb = self:ceTop(call.callee)
+      for _, a in ipairs(call.args) do self:ceTop(a) end
+      self:reserve(2)                              -- room for results cb+1, cb+2
+      self:emit(OPMAP[21], cb, #call.args, 3)
+      self:emit(OPMAP[2], fReg, cb)
+      self:emit(OPMAP[2], sReg, cb + 1)
+      self:emit(OPMAP[2], ctrlReg, cb + 2)
+    else
+      -- explicit explist: f, s, control as separate expressions
+      local iterRegs = {}
+      for _, e in ipairs(node.iters) do table.insert(iterRegs, self:ceTop(e)) end
+      if iterRegs[1] then self:emit(OPMAP[2], fReg, iterRegs[1]) end
+      if iterRegs[2] then self:emit(OPMAP[2], sReg, iterRegs[2]) end
+      if iterRegs[3] then self:emit(OPMAP[2], ctrlReg, iterRegs[3]) end
+    end
     self.free = self.nlocals
     local varRegs = {}
     for _, nm in ipairs(node.names) do table.insert(varRegs, self:declare(nm)) end
+    self.free = self.nlocals
     local top = self:here() + 1
-    local sf2 = self.free
+    -- build call: f(s, ctrl) -> #names results at callBase
     local callBase = self:reserve(1)
     self:emit(OPMAP[2], callBase, fReg)
-    self:emit(OPMAP[33], callBase, 0, #node.names)
-    for idx, nm in ipairs(node.names) do self:emit(OPMAP[2], varRegs[idx], callBase + idx - 1) end
-    self.free = sf2
-    local exit = self:emitJmpIfNot(varRegs[1])
+    local a1 = self:reserve(1); self:emit(OPMAP[2], a1, sReg)
+    local a2 = self:reserve(1); self:emit(OPMAP[2], a2, ctrlReg)
+    self:emit(OPMAP[21], callBase, 2, #node.names)
+    for idx = 1, #node.names do self:emit(OPMAP[2], varRegs[idx], callBase + idx - 1) end
+    self.free = self.nlocals
+    self:emit(OPMAP[2], ctrlReg, varRegs[1])   -- control = first var
+    local exit = self:emitJmpIfNot(varRegs[1]) -- stop when first var is nil/false
     self.free = self.nlocals
     self:compileBlock(node.body)
     self:patchTo(self:emitJmp(), top)
@@ -423,9 +464,12 @@ function Compiler:compileBlock(statements)
   for _, stmt in ipairs(statements) do self:compileStmt(stmt); self.free = self.nlocals end
 end
 
+-- Luau-safe reversible transform: modular add at build, subtract at runtime.
+-- Avoids the "~" bitwise operator (which does not exist in Luau) and the
+-- bit32 round-trip problem with negative sentinels (e.g. want = -1).
 local function encryptCode(code, key)
   local out = {}
-  for i = 1, #code do out[i] = (code[i] ~ key) end
+  for i = 1, #code do out[i] = code[i] + key end
   return out
 end
 local function checksum(code)
@@ -437,10 +481,10 @@ compileFunction = function(parent, params, body)
   local c = newCompiler(parent)
   for _, p in ipairs(params) do if p == "..." then fail() end; c:declare(p) end
   c:compileBlock(body)
-  c:emit(23)
+  c:emit(OPMAP[23])
   local key = nextKey()
   local enc = encryptCode(c.code, key)
-  return addProto({ code = enc, K = c.K, upvals = c.upvals, boxed = c.boxed, key = key, sum = checksum(enc) })
+  return addProto({ code = enc, K = c.K, upvals = c.upvals, boxed = c.boxed, key = key, sum = checksum(enc), np = #params })
 end
 
 -- ===== Serialize proto tree -> Lua data literal =====
@@ -472,7 +516,7 @@ local function serializeProtos()
   for _, p in ipairs(protos) do
     table.insert(parts, "{c={" .. table.concat(p.code, ",") .. "},k=" .. serializeK(p.K)
       .. ",u=" .. serializeUpvals(p.upvals) .. ",b=" .. serializeBoxed(p.boxed)
-      .. ",key=" .. p.key .. ",sum=" .. p.sum .. "}")
+      .. ",key=" .. p.key .. ",sum=" .. p.sum .. ",np=" .. (p.np or 0) .. "}")
   end
   return "{" .. table.concat(parts, ",") .. "}"
 end
@@ -482,14 +526,14 @@ function VM.transform(ast)
   local ok, res = pcall(function()
     local mainC = newCompiler(nil)
     mainC:compileBlock(ast.body)
-    mainC:emit(23)
+    mainC:emit(OPMAP[23])
     local mkey = nextKey()
     local menc = encryptCode(mainC.code, mkey)
-    return addProto({ code = menc, K = mainC.K, upvals = mainC.upvals, boxed = mainC.boxed, key = mkey, sum = checksum(menc) })
+    return addProto({ code = menc, K = mainC.K, upvals = mainC.upvals, boxed = mainC.boxed, key = mkey, sum = checksum(menc), np = 0 })
   end)
   if not ok then VM._payload = nil; return ast end
   local opmapParts = {}
-  for logical = 1, 34 do table.insert(opmapParts, OPMAP[logical]) end
+  for logical = 1, 36 do table.insert(opmapParts, OPMAP[logical]) end
   VM._payload = { protoData = serializeProtos(), mainIndex = res, opmap = "{" .. table.concat(opmapParts, ",") .. "}" }
   ast.body = { { kind = "CallStatement", call = { kind = "Raw", text = "__vmmain()" } } }
   return ast
@@ -513,7 +557,7 @@ function VM.prelude()
     "  local __sum = 5381",
     "  for __z = 1, #code do __sum = (__sum * 33 + code[__z]) % 2147483647 end",
     "  if __sum ~= proto.sum then error('integrity check failed') end",
-    "  local function d(x) return code[x] ~ __key end",
+    "  local function d(x) return code[x] - __key end",
     "  local R = {}",
     "  local cells = {}",
     "  for r in pairs(boxed) do cells[r] = { v = nil } end",
