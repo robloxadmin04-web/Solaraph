@@ -63,8 +63,8 @@ local ok, result = pcall(function()
   if opts.fold    then ast = ConstFold.fold(ast) end      -- 1. fold muna (constant expr)
   if opts.flatten then ast = CFlatten.flatten(ast) end    -- 2. control-flow flattening
   if opts.rename  then ast = Renamer.rename(ast) end      -- 3. rename locals
-  if opts.numbers then ast = NumEnc.obfuscate(ast) end    -- 4. obfuscate numbers
-  if opts.vm      then ast = VM.transform(ast) end        -- 5. VM-based (pagkatapos ng rename)
+  if opts.vm      then ast = VM.transform(ast) end        -- 4. VM-based (BAGO ang numbers: iniiwasan ang Raw nodes na nagpapa-fallback ng VM)
+  if opts.numbers then ast = NumEnc.obfuscate(ast) end    -- 5. obfuscate numbers (sa natirang non-VM na code)
   if opts.strings then ast = StringEnc.encrypt(ast) end   -- 6. encrypt strings
   if opts.dead    then ast = DeadCode.inject(ast) end     -- 7. dead code (HULI)
 
