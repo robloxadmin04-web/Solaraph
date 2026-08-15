@@ -2,6 +2,8 @@
 -- Parser: tokens -> AST. Luau-aware: continue, generalized for, compound assignment,
 -- type annotations (local, for, AT function params/return).
 
+local Lexer = require("lexer")
+
 local Parser = {}
 Parser.__index = Parser
 
@@ -11,11 +13,26 @@ local BINARY_PRECEDENCE = {
   ["<"] = 3, [">"] = 3, ["<="] = 3, [">="] = 3, ["~="] = 3, ["=="] = 3,
   [".."] = 4,
   ["+"] = 5, ["-"] = 5,
-  ["*"] = 6, ["/"] = 6, ["%"] = 6,
+  ["*"] = 6, ["/"] = 6, ["%"] = 6, ["//"] = 6,   -- Luau: floor division, same tier as * / %
 }
 
 local UNARY_PRECEDENCE = 7
-local COMPOUND = { ["+="]="+", ["-="]="-", ["*="]="*", ["/="]="/", ["%="]="%", ["^="]="^", ["..="]=".." }
+local COMPOUND = { ["+="]="+", ["-="]="-", ["*="]="*", ["/="]="/", ["%="]="%",
+                    ["^="]="^", ["..="]="..", ["//="]="//" }
+
+-- ============ Luau string interpolation: `text {expr} text` ============
+-- Desugar sa PARSE TIME tungo sa isang normal na concatenation expression
+-- (String .. tostring(expr) .. String ...). Dahil existing AST node kinds
+-- lang (String/Call/BinaryOp) ang ginagamit, awtomatikong sinusuportahan
+-- ito ng LAHAT ng ibang pass (renamer, constfold, numenc, stringenc, vm)
+-- nang walang kahit anong pagbabago doon.
+local INTERP_ESCAPES = {
+  n = "\n", t = "\t", r = "\r", ["\\"] = "\\",
+  ["`"] = "`", ["{"] = "{", ["}"] = "}", ['"'] = '"', ["'"] = "'",
+}
+local function unescapeInterpText(s)
+  return (s:gsub("\\(.)", function(c) return INTERP_ESCAPES[c] or ("\\" .. c) end))
+end
 
 function Parser.new(tokens)
   local self = setmetatable({}, Parser)
@@ -141,14 +158,117 @@ function Parser:parsePrimary()
   return node
 end
 
+-- Sub-parse ang laman ng isang "{expr}" na bahagi ng interpolated string,
+-- gamit ang parehong Lexer/Parser (bagong instance, hiwalay na token stream).
+function Parser:parseInterpExpr(exprSrc)
+  local tokens = Lexer.tokenize(exprSrc)
+  local sub = Parser.new(tokens)
+  local expr = sub:parseExpression(0)
+  return expr
+end
+
+-- raw: buong token value kasama ang backticks, hal. "`Score: {score}!`"
+-- Balik: isang expression node (BinaryOp ".." chain, o iisang String kung
+-- walang { } sa loob, o "" String kung walang laman).
+function Parser:parseInterpString(raw)
+  local body = raw:sub(2, #raw - 1)
+  local parts = {}
+  local textBuf = {}
+  local i, len = 1, #body
+  while i <= len do
+    local c = body:sub(i, i)
+    if c == "\\" and i < len then
+      table.insert(textBuf, body:sub(i, i + 1))
+      i = i + 2
+    elseif c == "{" then
+      if #textBuf > 0 then
+        table.insert(parts, { text = unescapeInterpText(table.concat(textBuf)) })
+        textBuf = {}
+      end
+      local depth = 1
+      local start = i + 1
+      local j = start
+      while j <= len and depth > 0 do
+        local cj = body:sub(j, j)
+        if cj == "{" then depth = depth + 1
+        elseif cj == "}" then
+          depth = depth - 1
+          if depth == 0 then break end
+        end
+        j = j + 1
+      end
+      local exprSrc = body:sub(start, j - 1)
+      table.insert(parts, { expr = self:parseInterpExpr(exprSrc) })
+      i = j + 1
+    else
+      table.insert(textBuf, c)
+      i = i + 1
+    end
+  end
+  if #textBuf > 0 then
+    table.insert(parts, { text = unescapeInterpText(table.concat(textBuf)) })
+  end
+
+  local result = nil
+  for _, p in ipairs(parts) do
+    local piece
+    if p.text ~= nil then
+      piece = { kind = "String", value = string.format("%q", p.text) }
+    else
+      piece = { kind = "Call", callee = { kind = "Variable", name = "tostring" }, args = { p.expr } }
+    end
+    result = (result == nil) and piece or { kind = "BinaryOp", op = "..", left = result, right = piece }
+  end
+  return result or { kind = "String", value = '""' }
+end
+
+-- Luau if-then-else EXPRESSION: `if cond then a elseif c2 then b else c`.
+-- Desugar sa isang immediately-invoked function expression (IIFE) gamit ang
+-- normal na If/Return/Function/Call node kinds â€” kaya ligtas din itong
+-- dumaan sa lahat ng ibang obfuscation pass nang walang extra code doon.
+function Parser:parseIfExpression()
+  self:expect("KEYWORD", "if")
+  local cond = self:parseExpression(0)
+  self:expect("KEYWORD", "then")
+  local thenExpr = self:parseExpression(0)
+  local clauses = { { cond = cond, body = { { kind = "Return", values = { thenExpr } } } } }
+  while self:check("KEYWORD", "elseif") do
+    self:advance()
+    local c = self:parseExpression(0)
+    self:expect("KEYWORD", "then")
+    local e = self:parseExpression(0)
+    table.insert(clauses, { cond = c, body = { { kind = "Return", values = { e } } } })
+  end
+  self:expect("KEYWORD", "else")
+  local elseExpr = self:parseExpression(0)
+  local ifNode = { kind = "If", clauses = clauses,
+                    elseBody = { { kind = "Return", values = { elseExpr } } } }
+  local fn = { kind = "Function", name = nil, params = {}, body = { ifNode } }
+  return { kind = "Call", callee = fn, args = {} }
+end
+
+-- Luau attributes: @native, @checked, atbp. Laktawan lang â€” walang epekto
+-- sa runtime behavior kaya ligtas na alisin sa output (hindi na kailangan
+-- i-preserve para gumana ang na-obfuscate na code).
+function Parser:skipAttributes()
+  while self:check("OPERATOR", "@") do
+    self:advance()
+    if self:check("IDENTIFIER") or self:check("KEYWORD") then self:advance() end
+  end
+end
+
 function Parser:parseAtom()
   local tok = self:peek()
   if tok.type == "NUMBER" then
     self:advance(); return { kind = "Number", value = tok.value }
   elseif tok.type == "STRING" then
     self:advance(); return { kind = "String", value = tok.value }
+  elseif tok.type == "INTERP_STRING" then
+    self:advance(); return self:parseInterpString(tok.value)
   elseif tok.type == "KEYWORD" and (tok.value == "true" or tok.value == "false" or tok.value == "nil") then
     self:advance(); return { kind = "Literal", value = tok.value }
+  elseif tok.type == "KEYWORD" and tok.value == "if" then
+    return self:parseIfExpression()
   elseif tok.type == "OPERATOR" and tok.value == "..." then
     self:advance(); return { kind = "Vararg" }
   elseif tok.type == "KEYWORD" and tok.value == "function" then
@@ -213,6 +333,7 @@ end
 
 function Parser:parseLocal()
   self:expect("KEYWORD", "local")
+  self:skipAttributes()   -- Luau: local @native function foo() ... end
   if self:check("KEYWORD", "function") then
     self:advance()
     local name = self:expect("IDENTIFIER").value
@@ -491,6 +612,7 @@ function Parser:parseBlock()
   while true do
     -- Lua/Luau: opsyonal na ";" separator â€” laktawan ang stray semicolons
     while self:accept("OPERATOR", ";") do end
+    self:skipAttributes()   -- Luau: @native / @checked bago ang function/local
     local tok = self:peek()
     if tok.type == "EOF"
        or (tok.type == "KEYWORD" and (tok.value == "end" or tok.value == "else"
