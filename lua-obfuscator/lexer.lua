@@ -109,6 +109,34 @@ function Lexer.tokenize(source)
       i, line = readLongBracket(source, bodyStart, level, line)
       table.insert(tokens, { type = "STRING", value = source:sub(start, i - 1), line = line })
 
+    elseif c == "`" then
+      -- Luau string interpolation: `text {expr} text`. Kunin ang BUONG raw
+      -- token (kasama ang { } at anumang laman sa loob) â€” ang parser na
+      -- ang mag-sub-parse ng mga {expr} bahagi. Depth-track ang { } para
+      -- hindi masira ng isang literal "}" sa loob ng interpolated expr
+      -- (hal. `{ {1,2,3}[1] }`), at huwag isara ang backtick sa loob ng {}.
+      local start = i
+      i = i + 1
+      local depth = 0
+      while i <= len do
+        local ch = source:sub(i, i)
+        if ch == "\\" then
+          i = i + 2
+        elseif ch == "{" then
+          depth = depth + 1; i = i + 1
+        elseif ch == "}" then
+          if depth > 0 then depth = depth - 1 end
+          i = i + 1
+        elseif ch == "`" and depth == 0 then
+          i = i + 1
+          break
+        else
+          if ch == "\n" then line = line + 1 end
+          i = i + 1
+        end
+      end
+      table.insert(tokens, { type = "INTERP_STRING", value = source:sub(start, i - 1), line = line })
+
     elseif c == '"' or c == "'" then
       local quote = c
       local start = i
@@ -140,15 +168,19 @@ function Lexer.tokenize(source)
       local three = source:sub(i, i + 2)
       local two   = source:sub(i, i + 1)
 
-      -- Luau compound assignment: ..= (3 char), tapos +=, -=, *=, /=, %=, ^= (2 char)
+      -- Luau compound assignment: ..=, //= (3 char), tapos +=, -=, *=, /=, %=, ^=,
+      -- // (floor division, 2 char)
       if three == "..." then
         table.insert(tokens, { type = "OPERATOR", value = "...", line = line })
         i = i + 3
       elseif three == "..=" then
         table.insert(tokens, { type = "OPERATOR", value = "..=", line = line })
         i = i + 3
+      elseif three == "//=" then
+        table.insert(tokens, { type = "OPERATOR", value = "//=", line = line })
+        i = i + 3
       elseif two == "==" or two == "~=" or two == "<="
-          or two == ">=" or two == ".." then
+          or two == ">=" or two == ".." or two == "//" then
         table.insert(tokens, { type = "OPERATOR", value = two, line = line })
         i = i + 2
       elseif two == "+=" or two == "-=" or two == "*=" or two == "/="
