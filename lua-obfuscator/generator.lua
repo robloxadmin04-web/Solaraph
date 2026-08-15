@@ -54,7 +54,12 @@ function Generator:genExpr(node)
   elseif k == "Call" then
     local args = {}
     for _, a in ipairs(node.args) do table.insert(args, self:genExpr(a)) end
-    return self:genExpr(node.callee) .. "(" .. table.concat(args, ", ") .. ")"
+    -- kailangan ng parens kung ang callee mismo ay isang function literal
+    -- (IIFE, hal. galing sa desugared Luau if-then-else expression):
+    -- "function() ... end()" ay invalid Lua, dapat "(function() ... end)()"
+    local calleeStr = self:genExpr(node.callee)
+    if node.callee.kind == "Function" then calleeStr = "(" .. calleeStr .. ")" end
+    return calleeStr .. "(" .. table.concat(args, ", ") .. ")"
 
   elseif k == "MethodCall" then
     local args = {}
